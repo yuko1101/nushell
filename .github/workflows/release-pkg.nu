@@ -222,9 +222,9 @@ if $os in ['macos-latest'] or $USE_UBUNTU {
 
 def 'cargo-build-nu' [] {
     if $os == 'windows-latest' {
-        cargo build --release --all --target $target
+        cargo build --release --all --target $target --features=system-clipboard
     } else {
-        cargo build --release --all --target $target --features=static-link-openssl
+        cargo build --release --all --target $target --features=static-link-openssl,system-clipboard
     }
 }
 
