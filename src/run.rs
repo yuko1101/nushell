@@ -23,12 +23,9 @@ pub(crate) fn run_commands(
     trace!("run_commands");
 
     let start_time = std::time::Instant::now();
-    let ask_to_create_config = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
+    let create_scaffold = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
 
     let mut stack = Stack::new();
-    if stack.has_env_var(engine_state, "NU_DISABLE_IR") {
-        stack.use_ir = false;
-    }
 
     // if the --no-config-file(-n) option is NOT passed, load the plugin file,
     // load the default env file or custom (depending on parsed_nu_cli_args.env_file),
@@ -49,7 +46,7 @@ pub(crate) fn run_commands(
                 &mut stack,
                 parsed_nu_cli_args.env_file,
                 true,
-                ask_to_create_config,
+                create_scaffold,
             );
         } else {
             config_files::read_default_env_file(engine_state, &mut stack)
@@ -58,7 +55,7 @@ pub(crate) fn run_commands(
         perf!("read env.nu", start_time, use_color);
 
         let start_time = std::time::Instant::now();
-        let ask_to_create_config = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
+        let create_scaffold = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
 
         // If we have a config file parameter *OR* we have a login shell parameter, read the config file
         if parsed_nu_cli_args.config_file.is_some() || parsed_nu_cli_args.login_shell.is_some() {
@@ -67,7 +64,7 @@ pub(crate) fn run_commands(
                 &mut stack,
                 parsed_nu_cli_args.config_file,
                 false,
-                ask_to_create_config,
+                create_scaffold,
             );
         }
 
@@ -119,10 +116,6 @@ pub(crate) fn run_file(
     trace!("run_file");
     let mut stack = Stack::new();
 
-    if stack.has_env_var(engine_state, "NU_DISABLE_IR") {
-        stack.use_ir = false;
-    }
-
     // if the --no-config-file(-n) option is NOT passed, load the plugin file,
     // load the default env file or custom (depending on parsed_nu_cli_args.env_file),
     // and maybe a custom config file (depending on parsed_nu_cli_args.config_file)
@@ -130,7 +123,7 @@ pub(crate) fn run_file(
     // if the --no-config-file(-n) flag is passed, do not load plugin, env, or config files
     if parsed_nu_cli_args.no_config_file.is_none() {
         let start_time = std::time::Instant::now();
-        let ask_to_create_config = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
+        let create_scaffold = nu_path::nu_config_dir().map_or(false, |p| !p.exists());
         #[cfg(feature = "plugin")]
         read_plugin_file(engine_state, parsed_nu_cli_args.plugin_file);
         perf!("read plugins", start_time, use_color);
@@ -143,7 +136,7 @@ pub(crate) fn run_file(
                 &mut stack,
                 parsed_nu_cli_args.env_file,
                 true,
-                ask_to_create_config,
+                create_scaffold,
             );
         } else {
             config_files::read_default_env_file(engine_state, &mut stack)
@@ -157,7 +150,7 @@ pub(crate) fn run_file(
                 &mut stack,
                 parsed_nu_cli_args.config_file,
                 false,
-                ask_to_create_config,
+                create_scaffold,
             );
         }
         perf!("read config.nu", start_time, use_color);
@@ -190,10 +183,6 @@ pub(crate) fn run_repl(
     trace!("run_repl");
     let mut stack = Stack::new();
     let start_time = std::time::Instant::now();
-
-    if stack.has_env_var(engine_state, "NU_DISABLE_IR") {
-        stack.use_ir = false;
-    }
 
     if parsed_nu_cli_args.no_config_file.is_none() {
         setup_config(

@@ -1,4 +1,3 @@
-use super::util::get_rest_for_glob_pattern;
 use crate::{DirBuilder, DirInfo};
 use chrono::{DateTime, Local, LocalResult, TimeZone, Utc};
 use nu_engine::glob_from;
@@ -9,13 +8,12 @@ use nu_path::{expand_path_with, expand_to_real_path};
 use nu_protocol::{DataSource, NuGlob, PipelineMetadata, Signals};
 use pathdiff::diff_paths;
 use rayon::prelude::*;
-
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 use std::{
+    cmp::Ordering,
     path::PathBuf,
-    sync::mpsc,
-    sync::{Arc, Mutex},
+    sync::{mpsc, Arc, Mutex},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -114,7 +112,7 @@ impl Command for Ls {
             call_span,
         };
 
-        let pattern_arg = get_rest_for_glob_pattern(engine_state, stack, call, 0)?;
+        let pattern_arg = call.rest::<Spanned<NuGlob>>(engine_state, stack, 0)?;
         let input_pattern_arg = if !call.has_positional_args(stack, 0) {
             None
         } else {
@@ -287,28 +285,10 @@ fn ls_for_one_pattern(
                 nu_path::expand_path_with(pat.item.as_ref(), &cwd, pat.item.is_expand());
             // Avoid checking and pushing "*" to the path when directory (do not show contents) flag is true
             if !directory && tmp_expanded.is_dir() {
-                if permission_denied(&tmp_expanded) {
-                    #[cfg(unix)]
-                    let error_msg = format!(
-                        "The permissions of {:o} do not allow access for this user",
-                        tmp_expanded
-                            .metadata()
-                            .expect("this shouldn't be called since we already know there is a dir")
-                            .permissions()
-                            .mode()
-                            & 0o0777
-                    );
-                    #[cfg(not(unix))]
-                    let error_msg = String::from("Permission denied");
-                    return Err(ShellError::GenericError {
-                        error: "Permission denied".into(),
-                        msg: error_msg,
-                        span: Some(p_tag),
-                        help: None,
-                        inner: vec![],
-                    });
-                }
-                if is_empty_dir(&tmp_expanded) {
+                if read_dir(&tmp_expanded, p_tag, use_threads)?
+                    .next()
+                    .is_none()
+                {
                     return Ok(Value::test_nothing().into_pipeline_data());
                 }
                 just_read_dir = !(pat.item.is_expand() && pat.item.as_ref().contains(GLOB_CHARS));
@@ -327,7 +307,7 @@ fn ls_for_one_pattern(
             // Avoid pushing "*" to the default path when directory (do not show contents) flag is true
             if directory {
                 (NuGlob::Expand(".".to_string()), false)
-            } else if is_empty_dir(&cwd) {
+            } else if read_dir(&cwd, p_tag, use_threads)?.next().is_none() {
                 return Ok(Value::test_nothing().into_pipeline_data());
             } else {
                 (NuGlob::Expand("*".to_string()), false)
@@ -336,10 +316,11 @@ fn ls_for_one_pattern(
     };
 
     let hidden_dir_specified = is_hidden_dir(pattern_arg.as_ref());
+
     let path = pattern_arg.into_spanned(p_tag);
     let (prefix, paths) = if just_read_dir {
         let expanded = nu_path::expand_path_with(path.item.as_ref(), &cwd, path.item.is_expand());
-        let paths = read_dir(&expanded)?;
+        let paths = read_dir(&expanded, p_tag, use_threads)?;
         // just need to read the directory, so prefix is path itself.
         (Some(expanded), paths)
     } else {
@@ -378,40 +359,42 @@ fn ls_for_one_pattern(
     };
 
     pool.install(|| {
-        paths_peek
-            .par_bridge()
-            .filter_map(move |x| match x {
-                Ok(path) => {
-                    let metadata = match std::fs::symlink_metadata(&path) {
-                        Ok(metadata) => Some(metadata),
-                        Err(_) => None,
-                    };
-                    let hidden_dir_clone = Arc::clone(&hidden_dirs);
-                    let mut hidden_dir_mutex = hidden_dir_clone
-                        .lock()
-                        .expect("Unable to acquire lock for hidden_dirs");
-                    if path_contains_hidden_folder(&path, &hidden_dir_mutex) {
-                        return None;
-                    }
-
-                    if !all && !hidden_dir_specified && is_hidden_dir(&path) {
-                        if path.is_dir() {
-                            hidden_dir_mutex.push(path);
-                            drop(hidden_dir_mutex);
+        rayon::spawn(move || {
+            let result = paths_peek
+                .par_bridge()
+                .filter_map(move |x| match x {
+                    Ok(path) => {
+                        let metadata = match std::fs::symlink_metadata(&path) {
+                            Ok(metadata) => Some(metadata),
+                            Err(_) => None,
+                        };
+                        let hidden_dir_clone = Arc::clone(&hidden_dirs);
+                        let mut hidden_dir_mutex = hidden_dir_clone
+                            .lock()
+                            .expect("Unable to acquire lock for hidden_dirs");
+                        if path_contains_hidden_folder(&path, &hidden_dir_mutex) {
+                            return None;
                         }
-                        return None;
-                    }
 
-                    let display_name = if short_names {
-                        path.file_name().map(|os| os.to_string_lossy().to_string())
-                    } else if full_paths || absolute_path {
-                        Some(path.to_string_lossy().to_string())
-                    } else if let Some(prefix) = &prefix {
-                        if let Ok(remainder) = path.strip_prefix(prefix) {
-                            if directory {
-                                // When the path is the same as the cwd, path_diff should be "."
-                                let path_diff =
-                                    if let Some(path_diff_not_dot) = diff_paths(&path, &cwd) {
+                        if !all && !hidden_dir_specified && is_hidden_dir(&path) {
+                            if path.is_dir() {
+                                hidden_dir_mutex.push(path);
+                                drop(hidden_dir_mutex);
+                            }
+                            return None;
+                        }
+
+                        let display_name = if short_names {
+                            path.file_name().map(|os| os.to_string_lossy().to_string())
+                        } else if full_paths || absolute_path {
+                            Some(path.to_string_lossy().to_string())
+                        } else if let Some(prefix) = &prefix {
+                            if let Ok(remainder) = path.strip_prefix(prefix) {
+                                if directory {
+                                    // When the path is the same as the cwd, path_diff should be "."
+                                    let path_diff = if let Some(path_diff_not_dot) =
+                                        diff_paths(&path, &cwd)
+                                    {
                                         let path_diff_not_dot = path_diff_not_dot.to_string_lossy();
                                         if path_diff_not_dot.is_empty() {
                                             ".".to_string()
@@ -422,88 +405,79 @@ fn ls_for_one_pattern(
                                         path.to_string_lossy().to_string()
                                     };
 
-                                Some(path_diff)
-                            } else {
-                                let new_prefix = if let Some(pfx) = diff_paths(prefix, &cwd) {
-                                    pfx
+                                    Some(path_diff)
                                 } else {
-                                    prefix.to_path_buf()
-                                };
+                                    let new_prefix = if let Some(pfx) = diff_paths(prefix, &cwd) {
+                                        pfx
+                                    } else {
+                                        prefix.to_path_buf()
+                                    };
 
-                                Some(new_prefix.join(remainder).to_string_lossy().to_string())
+                                    Some(new_prefix.join(remainder).to_string_lossy().to_string())
+                                }
+                            } else {
+                                Some(path.to_string_lossy().to_string())
                             }
                         } else {
                             Some(path.to_string_lossy().to_string())
                         }
-                    } else {
-                        Some(path.to_string_lossy().to_string())
+                        .ok_or_else(|| ShellError::GenericError {
+                            error: format!("Invalid file name: {:}", path.to_string_lossy()),
+                            msg: "invalid file name".into(),
+                            span: Some(call_span),
+                            help: None,
+                            inner: vec![],
+                        });
+
+                        match display_name {
+                            Ok(name) => {
+                                let entry = dir_entry_dict(
+                                    &path,
+                                    &name,
+                                    metadata.as_ref(),
+                                    call_span,
+                                    long,
+                                    du,
+                                    &signals_clone,
+                                    use_mime_type,
+                                    args.full_paths,
+                                );
+                                match entry {
+                                    Ok(value) => Some(value),
+                                    Err(err) => Some(Value::error(err, call_span)),
+                                }
+                            }
+                            Err(err) => Some(Value::error(err, call_span)),
+                        }
                     }
-                    .ok_or_else(|| ShellError::GenericError {
-                        error: format!("Invalid file name: {:}", path.to_string_lossy()),
-                        msg: "invalid file name".into(),
+                    Err(err) => Some(Value::error(err, call_span)),
+                })
+                .try_for_each(|stream| {
+                    tx.send(stream).map_err(|e| ShellError::GenericError {
+                        error: "Error streaming data".into(),
+                        msg: e.to_string(),
                         span: Some(call_span),
                         help: None,
                         inner: vec![],
-                    });
-
-                    match display_name {
-                        Ok(name) => {
-                            let entry = dir_entry_dict(
-                                &path,
-                                &name,
-                                metadata.as_ref(),
-                                call_span,
-                                long,
-                                du,
-                                &signals_clone,
-                                use_mime_type,
-                                args.full_paths,
-                            );
-                            match entry {
-                                Ok(value) => Some(value),
-                                Err(err) => Some(Value::error(err, call_span)),
-                            }
-                        }
-                        Err(err) => Some(Value::error(err, call_span)),
-                    }
-                }
-                Err(err) => Some(Value::error(err, call_span)),
-            })
-            .try_for_each(|stream| {
-                tx.send(stream).map_err(|e| ShellError::GenericError {
-                    error: "Error streaming data".into(),
-                    msg: e.to_string(),
+                    })
+                })
+                .map_err(|err| ShellError::GenericError {
+                    error: "Unable to create a rayon pool".into(),
+                    msg: err.to_string(),
                     span: Some(call_span),
                     help: None,
                     inner: vec![],
-                })
-            })
-    })
-    .map_err(|err| ShellError::GenericError {
-        error: "Unable to create a rayon pool".into(),
-        msg: err.to_string(),
-        span: Some(call_span),
-        help: None,
-        inner: vec![],
-    })?;
+                });
+
+            if let Err(error) = result {
+                let _ = tx.send(Value::error(error, call_span));
+            }
+        });
+    });
 
     Ok(rx
         .into_iter()
         .into_pipeline_data(call_span, signals.clone()))
-}
-
-fn permission_denied(dir: impl AsRef<Path>) -> bool {
-    match dir.as_ref().read_dir() {
-        Err(e) => matches!(e.kind(), std::io::ErrorKind::PermissionDenied),
-        Ok(_) => false,
-    }
-}
-
-fn is_empty_dir(dir: impl AsRef<Path>) -> bool {
-    match dir.as_ref().read_dir() {
-        Err(_) => true,
-        Ok(mut s) => s.next().is_none(),
-    }
 }
 
 fn is_hidden_dir(dir: impl AsRef<Path>) -> bool {
@@ -979,10 +953,37 @@ mod windows_helper {
 #[allow(clippy::type_complexity)]
 fn read_dir(
     f: &Path,
+    span: Span,
+    use_threads: bool,
 ) -> Result<Box<dyn Iterator<Item = Result<PathBuf, ShellError>> + Send>, ShellError> {
-    let iter = f.read_dir()?.map(|d| {
-        d.map(|r| r.path())
-            .map_err(|e| ShellError::IOError { msg: e.to_string() })
-    });
-    Ok(Box::new(iter))
+    let items = f
+        .read_dir()
+        .map_err(|error| {
+            if error.kind() == std::io::ErrorKind::PermissionDenied {
+                return ShellError::GenericError {
+                    error: "Permission denied".into(),
+                    msg: "The permissions may not allow access for this user".into(),
+                    span: Some(span),
+                    help: None,
+                    inner: vec![],
+                };
+            }
+
+            error.into()
+        })?
+        .map(|d| {
+            d.map(|r| r.path())
+                .map_err(|e| ShellError::IOError { msg: e.to_string() })
+        });
+    if !use_threads {
+        let mut collected = items.collect::<Vec<_>>();
+        collected.sort_by(|a, b| match (a, b) {
+            (Ok(a), Ok(b)) => a.cmp(b),
+            (Ok(_), Err(_)) => Ordering::Greater,
+            (Err(_), Ok(_)) => Ordering::Less,
+            (Err(_), Err(_)) => Ordering::Equal,
+        });
+        return Ok(Box::new(collected.into_iter()));
+    }
+    Ok(Box::new(items))
 }

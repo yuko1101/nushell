@@ -5,6 +5,7 @@ use crate::{
     },
     Config, IntoValue, OutDest, ShellError, Span, Value, VarId, ENV_VARIABLE_ID, NU_VARIABLE_ID,
 };
+use nu_utils::IgnoreCaseExt;
 use std::{
     collections::{HashMap, HashSet},
     fs::File,
@@ -45,8 +46,6 @@ pub struct Stack {
     pub arguments: ArgumentStack,
     /// Error handler stack for IR evaluation
     pub error_handlers: ErrorHandlerStack,
-    /// Set true to always use IR mode
-    pub use_ir: bool,
     pub recursion_count: u64,
     pub parent_stack: Option<Arc<Stack>>,
     /// Variables that have been deleted (this is used to hide values from parent stack lookups)
@@ -78,7 +77,6 @@ impl Stack {
             active_overlays: vec![DEFAULT_OVERLAY_NAME.to_string()],
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            use_ir: true,
             recursion_count: 0,
             parent_stack: None,
             parent_deletions: vec![],
@@ -99,7 +97,6 @@ impl Stack {
             active_overlays: parent.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            use_ir: parent.use_ir,
             recursion_count: parent.recursion_count,
             vars: vec![],
             parent_deletions: vec![],
@@ -317,7 +314,6 @@ impl Stack {
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            use_ir: self.use_ir,
             recursion_count: self.recursion_count,
             parent_stack: None,
             parent_deletions: vec![],
@@ -351,7 +347,6 @@ impl Stack {
             active_overlays: self.active_overlays.clone(),
             arguments: ArgumentStack::new(),
             error_handlers: ErrorHandlerStack::new(),
-            use_ir: self.use_ir,
             recursion_count: self.recursion_count,
             parent_stack: None,
             parent_deletions: vec![],
@@ -478,6 +473,40 @@ impl Stack {
                 if let Some(env_vars) = engine_state.env_vars.get(active_overlay) {
                     if let Some(v) = env_vars.get(name) {
                         return Some(v);
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    // Case-Insensitive version of get_env_var
+    pub fn get_env_var_insensitive<'a>(
+        &'a self,
+        engine_state: &'a EngineState,
+        name: &str,
+    ) -> Option<&'a Value> {
+        for scope in self.env_vars.iter().rev() {
+            for active_overlay in self.active_overlays.iter().rev() {
+                if let Some(env_vars) = scope.get(active_overlay) {
+                    if let Some(v) = env_vars.iter().find(|(k, _)| k.eq_ignore_case(name)) {
+                        return Some(v.1);
+                    }
+                }
+            }
+        }
+
+        for active_overlay in self.active_overlays.iter().rev() {
+            let is_hidden = if let Some(env_hidden) = self.env_hidden.get(active_overlay) {
+                env_hidden.iter().any(|k| k.eq_ignore_case(name))
+            } else {
+                false
+            };
+
+            if !is_hidden {
+                if let Some(env_vars) = engine_state.env_vars.get(active_overlay) {
+                    if let Some(v) = env_vars.iter().find(|(k, _)| k.eq_ignore_case(name)) {
+                        return Some(v.1);
                     }
                 }
             }

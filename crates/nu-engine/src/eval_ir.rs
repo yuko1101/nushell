@@ -4,15 +4,19 @@ use nu_path::{expand_path_with, AbsolutePathBuf};
 use nu_protocol::{
     ast::{Bits, Block, Boolean, CellPath, Comparison, Math, Operator},
     debugger::DebugContext,
-    engine::{Argument, Closure, EngineState, ErrorHandler, Matcher, Redirection, Stack},
+    engine::{
+        Argument, Closure, EngineState, ErrorHandler, Matcher, Redirection, Stack, StateWorkingSet,
+    },
     ir::{Call, DataSlice, Instruction, IrAstRef, IrBlock, Literal, RedirectMode},
-    ByteStreamSource, DataSource, DeclId, ErrSpan, Flag, IntoPipelineData, IntoSpanned, ListStream,
-    OutDest, PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError,
-    Signals, Signature, Span, Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
+    DataSource, DeclId, ErrSpan, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest,
+    PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError, Signals,
+    Signature, Span, Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
 };
 use nu_utils::IgnoreCaseExt;
 
-use crate::{eval::is_automatic_env_var, eval_block_with_early_return};
+use crate::{
+    convert_env_vars, eval::is_automatic_env_var, eval_block_with_early_return, ENV_CONVERSIONS,
+};
 
 /// Evaluate the compiled representation of a [`Block`].
 pub fn eval_ir_block<D: DebugContext>(
@@ -220,17 +224,8 @@ fn eval_ir_block_impl<D: DebugContext>(
             }
             Err(err) => {
                 if let Some(error_handler) = ctx.stack.error_handlers.pop(ctx.error_handler_base) {
-                    let fancy_errors = match ctx.engine_state.get_config().error_style {
-                        nu_protocol::ErrorStyle::Fancy => true,
-                        nu_protocol::ErrorStyle::Plain => false,
-                    };
                     // If an error handler is set, branch there
-                    prepare_error_handler(
-                        ctx,
-                        error_handler,
-                        Some(err.into_spanned(*span)),
-                        fancy_errors,
-                    );
+                    prepare_error_handler(ctx, error_handler, Some(err.into_spanned(*span)));
                     pc = error_handler.handler_index;
                 } else {
                     // If not, exit the block with the error
@@ -255,7 +250,6 @@ fn prepare_error_handler(
     ctx: &mut EvalContext<'_>,
     error_handler: ErrorHandler,
     error: Option<Spanned<ShellError>>,
-    fancy_errors: bool,
 ) {
     if let Some(reg_id) = error_handler.error_register {
         if let Some(error) = error {
@@ -266,7 +260,7 @@ fn prepare_error_handler(
                 reg_id,
                 error
                     .item
-                    .into_value(error.span, fancy_errors)
+                    .into_value(&StateWorkingSet::new(ctx.engine_state), error.span)
                     .into_pipeline_data(),
             );
         } else {
@@ -392,9 +386,15 @@ fn eval_instruction<D: DebugContext>(
 
             if !is_automatic_env_var(&key) {
                 let is_config = key == "config";
-                ctx.stack.add_env_var(key.into_owned(), value);
+                let update_conversions = key == ENV_CONVERSIONS;
+
+                ctx.stack.add_env_var(key.into_owned(), value.clone());
+
                 if is_config {
                     ctx.stack.update_config(ctx.engine_state)?;
+                }
+                if update_conversions {
+                    convert_env_vars(ctx.stack, ctx.engine_state, &value)?;
                 }
                 Ok(Continue)
             } else {
@@ -486,8 +486,9 @@ fn eval_instruction<D: DebugContext>(
             Ok(Continue)
         }
         Instruction::CheckErrRedirected { src } => match ctx.borrow_reg(*src) {
+            #[cfg(feature = "os")]
             PipelineData::ByteStream(stream, _)
-                if matches!(stream.source(), ByteStreamSource::Child(_)) =>
+                if matches!(stream.source(), nu_protocol::ByteStreamSource::Child(_)) =>
             {
                 Ok(Continue)
             }
@@ -521,7 +522,7 @@ fn eval_instruction<D: DebugContext>(
                     span: Some(*span),
                 })?;
             let is_external = if let PipelineData::ByteStream(stream, ..) = &src {
-                matches!(stream.source(), ByteStreamSource::Child(..))
+                stream.source().is_external()
             } else {
                 false
             };
@@ -956,7 +957,7 @@ fn binary_op(
         },
         Operator::Math(mat) => match mat {
             Math::Plus => lhs_val.add(op_span, &rhs_val, span)?,
-            Math::Append => lhs_val.append(op_span, &rhs_val, span)?,
+            Math::Concat => lhs_val.concat(op_span, &rhs_val, span)?,
             Math::Minus => lhs_val.sub(op_span, &rhs_val, span)?,
             Math::Multiply => lhs_val.mul(op_span, &rhs_val, span)?,
             Math::Divide => lhs_val.div(op_span, &rhs_val, span)?,
