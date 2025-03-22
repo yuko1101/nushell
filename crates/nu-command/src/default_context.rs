@@ -58,7 +58,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Interleave,
             Items,
             Join,
-            SplitBy,
             Take,
             Merge,
             MergeDeep,
@@ -71,7 +70,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             ParEach,
             ChunkBy,
             Prepend,
-            Range,
             Reduce,
             Reject,
             Rename,
@@ -80,6 +78,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Skip,
             SkipUntil,
             SkipWhile,
+            Slice,
             Sort,
             SortBy,
             SplitList,
@@ -145,6 +144,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             HelpCommands,
             HelpModules,
             HelpOperators,
+            HelpPipeAndRedirect,
             HelpEscapes,
         };
 
@@ -241,7 +241,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Start,
             Rm,
             Save,
-            Touch,
             UTouch,
             Glob,
             Watch,
@@ -276,8 +275,6 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             DateHumanize,
             DateListTimezones,
             DateNow,
-            DateToRecord,
-            DateToTable,
             DateToTimezone,
         };
 
@@ -316,6 +313,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             Where,
             ToXml,
             ToYaml,
+            ToYml,
         };
 
         // Viewers
@@ -354,6 +352,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             ConfigFlatten,
             ConfigMeta,
             ConfigReset,
+            ConfigUseColors,
         };
 
         // Math
@@ -405,6 +404,7 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
             HttpPut,
             HttpOptions,
             Port,
+            VersionCheck,
         }
         bind_command! {
             Url,
@@ -448,7 +448,16 @@ pub fn add_shell_command_context(mut engine_state: EngineState) -> EngineState {
         // Experimental
         bind_command! {
             IsAdmin,
+            JobSpawn,
+            JobList,
+            JobKill,
+            Job,
         };
+
+        #[cfg(all(unix, feature = "os"))]
+        bind_command! {
+            JobUnfreeze,
+        }
 
         // Removed
         bind_command! {

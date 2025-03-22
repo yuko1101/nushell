@@ -8,9 +8,10 @@ use nu_protocol::{
         Argument, Closure, EngineState, ErrorHandler, Matcher, Redirection, Stack, StateWorkingSet,
     },
     ir::{Call, DataSlice, Instruction, IrAstRef, IrBlock, Literal, RedirectMode},
-    DataSource, DeclId, ErrSpan, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest,
-    PipelineData, PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError, Signals,
-    Signature, Span, Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
+    shell_error::io::IoError,
+    DataSource, DeclId, Flag, IntoPipelineData, IntoSpanned, ListStream, OutDest, PipelineData,
+    PipelineMetadata, PositionalArg, Range, Record, RegId, ShellError, Signals, Signature, Span,
+    Spanned, Type, Value, VarId, ENV_VARIABLE_ID,
 };
 use nu_utils::IgnoreCaseExt;
 
@@ -186,6 +187,7 @@ fn eval_ir_block_impl<D: DebugContext>(
 
     // Program counter, starts at zero.
     let mut pc = 0;
+    let need_backtrace = ctx.engine_state.get_env_var("NU_BACKTRACE").is_some();
 
     while pc < ir_block.instructions.len() {
         let instruction = &ir_block.instructions[pc];
@@ -194,7 +196,7 @@ fn eval_ir_block_impl<D: DebugContext>(
 
         D::enter_instruction(ctx.engine_state, ir_block, pc, ctx.registers);
 
-        let result = eval_instruction::<D>(ctx, instruction, span, ast);
+        let result = eval_instruction::<D>(ctx, instruction, span, ast, need_backtrace);
 
         D::leave_instruction(
             ctx.engine_state,
@@ -227,8 +229,10 @@ fn eval_ir_block_impl<D: DebugContext>(
                     // If an error handler is set, branch there
                     prepare_error_handler(ctx, error_handler, Some(err.into_spanned(*span)));
                     pc = error_handler.handler_index;
+                } else if need_backtrace {
+                    let err = ShellError::into_chainned(err, *span);
+                    return Err(err);
                 } else {
-                    // If not, exit the block with the error
                     return Err(err);
                 }
             }
@@ -284,6 +288,7 @@ fn eval_instruction<D: DebugContext>(
     instruction: &Instruction,
     span: &Span,
     ast: &Option<IrAstRef>,
+    need_backtrace: bool,
 ) -> Result<InstructionResult, ShellError> {
     use self::InstructionResult::*;
 
@@ -547,7 +552,14 @@ fn eval_instruction<D: DebugContext>(
         }
         Instruction::Call { decl_id, src_dst } => {
             let input = ctx.take_reg(*src_dst);
-            let result = eval_call::<D>(ctx, *decl_id, *span, input)?;
+            let mut result = eval_call::<D>(ctx, *decl_id, *span, input)?;
+            if need_backtrace {
+                match &mut result {
+                    PipelineData::ByteStream(s, ..) => s.push_caller_span(*span),
+                    PipelineData::ListStream(s, ..) => s.push_caller_span(*span),
+                    _ => (),
+                };
+            }
             ctx.put_reg(*src_dst, result);
             Ok(Continue)
         }
@@ -845,7 +857,7 @@ fn literal_value(
             let captures = block
                 .captures
                 .iter()
-                .map(|var_id| get_var(ctx, *var_id, span).map(|val| (*var_id, val)))
+                .map(|(var_id, span)| get_var(ctx, *var_id, *span).map(|val| (*var_id, val)))
                 .collect::<Result<Vec<_>, ShellError>>()?;
             Value::closure(
                 Closure {
@@ -952,23 +964,25 @@ fn binary_op(
             }
             Comparison::In => lhs_val.r#in(op_span, &rhs_val, span)?,
             Comparison::NotIn => lhs_val.not_in(op_span, &rhs_val, span)?,
+            Comparison::Has => lhs_val.has(op_span, &rhs_val, span)?,
+            Comparison::NotHas => lhs_val.not_has(op_span, &rhs_val, span)?,
             Comparison::StartsWith => lhs_val.starts_with(op_span, &rhs_val, span)?,
             Comparison::EndsWith => lhs_val.ends_with(op_span, &rhs_val, span)?,
         },
         Operator::Math(mat) => match mat {
-            Math::Plus => lhs_val.add(op_span, &rhs_val, span)?,
-            Math::Concat => lhs_val.concat(op_span, &rhs_val, span)?,
-            Math::Minus => lhs_val.sub(op_span, &rhs_val, span)?,
+            Math::Add => lhs_val.add(op_span, &rhs_val, span)?,
+            Math::Subtract => lhs_val.sub(op_span, &rhs_val, span)?,
             Math::Multiply => lhs_val.mul(op_span, &rhs_val, span)?,
             Math::Divide => lhs_val.div(op_span, &rhs_val, span)?,
+            Math::FloorDivide => lhs_val.floor_div(op_span, &rhs_val, span)?,
             Math::Modulo => lhs_val.modulo(op_span, &rhs_val, span)?,
-            Math::FloorDivision => lhs_val.floor_div(op_span, &rhs_val, span)?,
             Math::Pow => lhs_val.pow(op_span, &rhs_val, span)?,
+            Math::Concatenate => lhs_val.concat(op_span, &rhs_val, span)?,
         },
         Operator::Boolean(bl) => match bl {
-            Boolean::And => lhs_val.and(op_span, &rhs_val, span)?,
             Boolean::Or => lhs_val.or(op_span, &rhs_val, span)?,
             Boolean::Xor => lhs_val.xor(op_span, &rhs_val, span)?,
+            Boolean::And => lhs_val.and(op_span, &rhs_val, span)?,
         },
         Operator::Bits(bit) => match bit {
             Bits::BitOr => lhs_val.bit_or(op_span, &rhs_val, span)?,
@@ -1018,6 +1032,9 @@ fn eval_call<D: DebugContext>(
         // If the decl is a custom command
         let block = engine_state.get_block(block_id);
 
+        // check types after acquiring block to avoid unnecessarily cloning Signature
+        check_input_types(&input, &block.signature, head)?;
+
         // Set up a callee stack with the captures and move arguments from the stack into variables
         let mut callee_stack = caller_stack.gather_captures(engine_state, &block.captures);
 
@@ -1042,6 +1059,8 @@ fn eval_call<D: DebugContext>(
             redirect_env(engine_state, &mut caller_stack, &callee_stack);
         }
     } else {
+        check_input_types(&input, &decl.signature(), head)?;
+
         // FIXME: precalculate this and save it somewhere
         let span = Span::merge_many(
             std::iter::once(head).chain(
@@ -1246,23 +1265,83 @@ fn gather_arguments(
 
 /// Type check helper. Produces `CantConvert` error if `val` is not compatible with `ty`.
 fn check_type(val: &Value, ty: &Type) -> Result<(), ShellError> {
-    if match val {
-        // An empty list is compatible with any list or table type
-        Value::List { vals, .. } if vals.is_empty() => {
-            matches!(ty, Type::Any | Type::List(_) | Type::Table(_))
-        }
-        // FIXME: the allocation that might be required here is not great, it would be nice to be
-        // able to just directly check whether a value is compatible with a type
-        _ => val.get_type().is_subtype(ty),
-    } {
-        Ok(())
-    } else {
-        Err(ShellError::CantConvert {
+    match val {
+        Value::Error { error, .. } => Err(*error.clone()),
+        _ if val.is_subtype_of(ty) => Ok(()),
+        _ => Err(ShellError::CantConvert {
             to_type: ty.to_string(),
             from_type: val.get_type().to_string(),
             span: val.span(),
             help: None,
-        })
+        }),
+    }
+}
+
+/// Type check pipeline input against command's input types
+fn check_input_types(
+    input: &PipelineData,
+    signature: &Signature,
+    head: Span,
+) -> Result<(), ShellError> {
+    let io_types = &signature.input_output_types;
+
+    // If a command doesn't have any input/output types, then treat command input type as any
+    if io_types.is_empty() {
+        return Ok(());
+    }
+
+    // If a command only has a nothing input type, then allow any input data
+    if io_types.iter().all(|(intype, _)| intype == &Type::Nothing) {
+        return Ok(());
+    }
+
+    match input {
+        // early return error directly if detected
+        PipelineData::Value(Value::Error { error, .. }, ..) => return Err(*error.clone()),
+        // bypass run-time typechecking for custom types
+        PipelineData::Value(Value::Custom { .. }, ..) => return Ok(()),
+        _ => (),
+    }
+
+    // Check if the input type is compatible with *any* of the command's possible input types
+    if io_types
+        .iter()
+        .any(|(command_type, _)| input.is_subtype_of(command_type))
+    {
+        return Ok(());
+    }
+
+    let mut input_types = io_types
+        .iter()
+        .map(|(input, _)| input.to_string())
+        .collect::<Vec<String>>();
+
+    let expected_string = match input_types.len() {
+        0 => {
+            return Err(ShellError::NushellFailed {
+                msg: "Command input type strings is empty, despite being non-zero earlier"
+                    .to_string(),
+            })
+        }
+        1 => input_types.swap_remove(0),
+        2 => input_types.join(" and "),
+        _ => {
+            input_types
+                .last_mut()
+                .expect("Vector with length >2 has no elements")
+                .insert_str(0, "and ");
+            input_types.join(", ")
+        }
+    };
+
+    match input {
+        PipelineData::Empty => Err(ShellError::PipelineEmpty { dst_span: head }),
+        _ => Err(ShellError::OnlySupportsThisInputType {
+            exp_input_type: expected_string,
+            wrong_type: input.get_type().to_string(),
+            dst_span: head,
+            src_span: input.span().unwrap_or(Span::unknown()),
+        }),
     }
 }
 
@@ -1392,14 +1471,40 @@ fn drain(ctx: &mut EvalContext<'_>, data: PipelineData) -> Result<InstructionRes
     match data {
         PipelineData::ByteStream(stream, ..) => {
             let span = stream.span();
-            if let Err(err) = stream.drain() {
+            let callback_spans = stream.get_caller_spans().clone();
+            if let Err(mut err) = stream.drain() {
                 ctx.stack.set_last_error(&err);
-                return Err(err);
+                if callback_spans.is_empty() {
+                    return Err(err);
+                } else {
+                    for s in callback_spans {
+                        err = ShellError::EvalBlockWithInput {
+                            span: s,
+                            sources: vec![err],
+                        }
+                    }
+                    return Err(err);
+                }
             } else {
                 ctx.stack.set_last_exit_code(0, span);
             }
         }
-        PipelineData::ListStream(stream, ..) => stream.drain()?,
+        PipelineData::ListStream(stream, ..) => {
+            let callback_spans = stream.get_caller_spans().clone();
+            if let Err(mut err) = stream.drain() {
+                if callback_spans.is_empty() {
+                    return Err(err);
+                } else {
+                    for s in callback_spans {
+                        err = ShellError::EvalBlockWithInput {
+                            span: s,
+                            sources: vec![err],
+                        }
+                    }
+                    return Err(err);
+                }
+            }
+        }
         PipelineData::Value(..) | PipelineData::Empty => {}
     }
     Ok(Continue)
@@ -1422,8 +1527,8 @@ fn open_file(ctx: &EvalContext<'_>, path: &Value, append: bool) -> Result<Arc<Fi
     }
     let file = options
         .create(true)
-        .open(path_expanded)
-        .err_span(path.span())?;
+        .open(&path_expanded)
+        .map_err(|err| IoError::new(err.kind(), path.span(), path_expanded))?;
     Ok(Arc::new(file))
 }
 

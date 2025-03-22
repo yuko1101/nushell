@@ -120,7 +120,7 @@ impl<'a> StyleComputer<'a> {
             ("int".to_string(), ComputableStyle::Static(Color::White.normal())),
             ("filesize".to_string(), ComputableStyle::Static(Color::Cyan.normal())),
             ("duration".to_string(), ComputableStyle::Static(Color::White.normal())),
-            ("date".to_string(), ComputableStyle::Static(Color::Purple.normal())),
+            ("datetime".to_string(), ComputableStyle::Static(Color::Purple.normal())),
             ("range".to_string(), ComputableStyle::Static(Color::White.normal())),
             ("float".to_string(), ComputableStyle::Static(Color::White.normal())),
             ("string".to_string(), ComputableStyle::Static(Color::White.normal())),
@@ -169,7 +169,7 @@ impl<'a> StyleComputer<'a> {
 
 // Because EngineState doesn't have Debug (Dec 2022),
 // this incomplete representation must be used.
-impl<'a> Debug for StyleComputer<'a> {
+impl Debug for StyleComputer<'_> {
     fn fmt(&self, f: &mut Formatter<'_>) -> Result {
         f.debug_struct("StyleComputer")
             .field("map", &self.map)
@@ -240,7 +240,9 @@ fn test_computable_style_closure_errors() {
     ];
     let actual_repl = nu!(nu_repl_code(&inp));
     // Check that the error was printed
-    assert!(actual_repl.err.contains("type mismatch for operator"));
+    assert!(actual_repl
+        .err
+        .contains("nu::shell::operator_incompatible_types"));
     // Check that the value was printed
     assert!(actual_repl.out.contains("bell"));
 }

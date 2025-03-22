@@ -46,7 +46,7 @@ export def clippy [
         ^cargo clippy
             --workspace
             --exclude nu_plugin_*
-            --features ($features | str join ",")
+            --features ($features | default [] | str join ",")
             --
             -D warnings
             -D clippy::unwrap_used
@@ -62,7 +62,7 @@ export def clippy [
             --tests
             --workspace
             --exclude nu_plugin_*
-            --features ($features | str join ",")
+            --features ($features | default [] | str join ",")
             --
             -D warnings
     )
@@ -96,13 +96,13 @@ export def test [
         if $workspace {
             ^cargo nextest run --all
         } else {
-            ^cargo nextest run --features ($features | str join ",")
+            ^cargo nextest run --features ($features | default [] | str join ",")
         }
     } else {
         if $workspace {
             ^cargo test --workspace
         } else {
-            ^cargo test --features ($features | str join ",")
+            ^cargo test --features ($features | default [] | str join ",")
         }
     }
 }
@@ -345,7 +345,7 @@ export def build [
     ...features: string@"nu-complete list features"  # a space-separated list of feature to install with Nushell
     --all # build all plugins with Nushell
 ] {
-    build-nushell ($features | str join ",")
+    build-nushell ($features | default [] | str join ",")
 
     if not $all {
         return
@@ -355,6 +355,7 @@ export def build [
         nu_plugin_inc,
         nu_plugin_gstat,
         nu_plugin_query,
+        nu_plugin_polars,
         nu_plugin_example,
         nu_plugin_custom_values,
         nu_plugin_formats,
@@ -384,7 +385,7 @@ export def install [
     --all # install all plugins with Nushell
 ] {
     touch crates/nu-cmd-lang/build.rs # needed to make sure `version` has the correct `commit_hash`
-    ^cargo install --path . --features ($features | str join ",") --locked --force
+    ^cargo install --path . --features ($features | default [] | str join ",") --locked --force
     if not $all {
         return
     }
@@ -393,6 +394,7 @@ export def install [
         nu_plugin_inc,
         nu_plugin_gstat,
         nu_plugin_query,
+        nu_plugin_polars,
         nu_plugin_example,
         nu_plugin_custom_values,
         nu_plugin_formats,
@@ -628,9 +630,9 @@ export def "build wasm" [] {
         print $'(char nl)Building ($crate) for wasm'
         print '----------------------------'
         (
-            ^cargo build 
-                -p $crate 
-                --target wasm32-unknown-unknown 
+            ^cargo build
+                -p $crate
+                --target wasm32-unknown-unknown
                 --no-default-features
         )
     }
@@ -646,9 +648,9 @@ export def "clippy wasm" [] {
         print $'(char nl)Checking ($crate) for wasm'
         print '----------------------------'
         (
-            ^cargo clippy 
-                -p $crate 
-                --target wasm32-unknown-unknown 
+            ^cargo clippy
+                -p $crate
+                --target wasm32-unknown-unknown
                 --no-default-features
                 --
                 -D warnings

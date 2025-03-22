@@ -1,6 +1,6 @@
 use nu_engine::{command_prelude::*, get_eval_block_with_early_return};
 use nu_path::canonicalize_with;
-use nu_protocol::{engine::CommandType, BlockId};
+use nu_protocol::{engine::CommandType, shell_error::io::IoError, BlockId};
 
 /// Source a file for environment variables.
 #[derive(Clone)]
@@ -16,8 +16,8 @@ impl Command for Source {
             .input_output_types(vec![(Type::Any, Type::Any)])
             .required(
                 "filename",
-                SyntaxShape::Filepath,
-                "The filepath to the script file to source.",
+                SyntaxShape::OneOf(vec![SyntaxShape::Filepath, SyntaxShape::Nothing]),
+                "The filepath to the script file to source (`null` for no-op).",
             )
             .category(Category::Core)
     }
@@ -42,6 +42,9 @@ impl Command for Source {
         call: &Call,
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
+        if call.get_parser_info(stack, "noop").is_some() {
+            return Ok(PipelineData::empty());
+        }
         // Note: two hidden positionals are used here that are injected by the parser:
         // 1. The block_id that corresponded to the 0th position
         // 2. The block_id_name that corresponded to the file name at the 0th position
@@ -52,11 +55,13 @@ impl Command for Source {
         let cwd = engine_state.cwd_as_string(Some(stack))?;
         let pb = std::path::PathBuf::from(block_id_name);
         let parent = pb.parent().unwrap_or(std::path::Path::new(""));
-        let file_path =
-            canonicalize_with(pb.as_path(), cwd).map_err(|err| ShellError::FileNotFoundCustom {
-                msg: format!("Could not access file '{}': {err}", pb.as_path().display()),
-                span: Span::unknown(),
-            })?;
+        let file_path = canonicalize_with(pb.as_path(), cwd).map_err(|err| {
+            IoError::new(
+                err.kind().not_found_as(NotFound::File),
+                call.head,
+                pb.clone(),
+            )
+        })?;
 
         // Note: We intentionally left out PROCESS_PATH since it's supposed to
         // to work like argv[0] in C, which is the name of the program being executed.
@@ -107,6 +112,16 @@ impl Command for Source {
                 example: r#"source ./foo.nu; say-hi"#,
                 result: None,
             },
+            Example {
+                description: "Sourcing `null` is a no-op.",
+                example: r#"source null"#,
+                result: None,
+            },
+            Example {
+                description: "Source can be used with const variables.",
+                example: r#"const file = if $nu.is-interactive { "interactive.nu" } else { null }; source $file"#,
+                result: None,
+            }
         ]
     }
 }

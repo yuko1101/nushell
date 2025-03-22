@@ -3,7 +3,11 @@ use super::util::try_interaction;
 use nu_engine::{command_prelude::*, env::current_dir};
 use nu_glob::MatchOptions;
 use nu_path::expand_path_with;
-use nu_protocol::{report_shell_error, NuGlob};
+use nu_protocol::{
+    report_shell_error,
+    shell_error::{self, io::IoError},
+    NuGlob,
+};
 #[cfg(unix)]
 use std::os::unix::prelude::FileTypeExt;
 use std::{
@@ -256,6 +260,7 @@ fn rm(
                 require_literal_leading_dot: true,
                 ..Default::default()
             }),
+            engine_state.signals().clone(),
         ) {
             Ok(files) => {
                 for file in files.1 {
@@ -299,9 +304,17 @@ fn rm(
                 }
             }
             Err(e) => {
-                // glob_from may canonicalize path and return `DirectoryNotFound`
+                // glob_from may canonicalize path and return an error when a directory is not found
                 // nushell should suppress the error if `--force` is used.
-                if !(force && matches!(e, ShellError::DirectoryNotFound { .. })) {
+                if !(force
+                    && matches!(
+                        e,
+                        ShellError::Io(IoError {
+                            kind: shell_error::io::ErrorKind::Std(std::io::ErrorKind::NotFound),
+                            ..
+                        })
+                    ))
+                {
                     return Err(e);
                 }
             }
@@ -413,8 +426,7 @@ fn rm(
                 };
 
                 if let Err(e) = result {
-                    let msg = format!("Could not delete {:}: {e:}", f.to_string_lossy());
-                    Err(ShellError::RemoveNotPossible { msg, span })
+                    Err(ShellError::Io(IoError::new(e.kind(), span, f)))
                 } else if verbose {
                     let msg = if interactive && !confirmed {
                         "not deleted"

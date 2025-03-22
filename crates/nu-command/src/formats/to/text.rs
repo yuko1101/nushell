@@ -1,8 +1,6 @@
 use chrono_humanize::HumanTime;
 use nu_engine::command_prelude::*;
-use nu_protocol::{
-    format_duration, format_filesize_from_conf, ByteStream, Config, PipelineMetadata,
-};
+use nu_protocol::{format_duration, shell_error::io::IoError, ByteStream, PipelineMetadata};
 use std::io::Write;
 
 const LINE_ENDING: &str = if cfg!(target_os = "windows") {
@@ -27,6 +25,11 @@ impl Command for ToText {
                 "Do not append a newline to the end of the text",
                 Some('n'),
             )
+            .switch(
+                "serialize",
+                "serialize nushell types that cannot be deserialized",
+                Some('s'),
+            )
             .category(Category::Formats)
     }
 
@@ -43,8 +46,8 @@ impl Command for ToText {
     ) -> Result<PipelineData, ShellError> {
         let head = call.head;
         let no_newline = call.has_flag(engine_state, stack, "no-newline")?;
+        let serialize_types = call.has_flag(engine_state, stack, "serialize")?;
         let input = input.try_expand_range()?;
-        let config = stack.get_config(engine_state);
 
         match input {
             PipelineData::Empty => Ok(Value::string(String::new(), head)
@@ -56,7 +59,7 @@ impl Command for ToText {
                         Value::Record { val, .. } => !val.is_empty(),
                         _ => false,
                     };
-                let mut str = local_into_string(value, LINE_ENDING, &config);
+                let mut str = local_into_string(engine_state, value, LINE_ENDING, serialize_types);
                 if add_trailing {
                     str.push_str(LINE_ENDING);
                 }
@@ -67,9 +70,11 @@ impl Command for ToText {
             }
             PipelineData::ListStream(stream, meta) => {
                 let span = stream.span();
+                let from_io_error = IoError::factory(head, None);
                 let stream = if no_newline {
                     let mut first = true;
                     let mut iter = stream.into_inner();
+                    let engine_state_clone = engine_state.clone();
                     ByteStream::from_fn(
                         span,
                         engine_state.signals().clone(),
@@ -81,19 +86,30 @@ impl Command for ToText {
                             if first {
                                 first = false;
                             } else {
-                                write!(buf, "{LINE_ENDING}").err_span(head)?;
+                                write!(buf, "{LINE_ENDING}").map_err(&from_io_error)?;
                             }
                             // TODO: write directly into `buf` instead of creating an intermediate
                             // string.
-                            let str = local_into_string(val, LINE_ENDING, &config);
-                            write!(buf, "{str}").err_span(head)?;
+                            let str = local_into_string(
+                                &engine_state_clone,
+                                val,
+                                LINE_ENDING,
+                                serialize_types,
+                            );
+                            write!(buf, "{str}").map_err(&from_io_error)?;
                             Ok(true)
                         },
                     )
                 } else {
+                    let engine_state_clone = engine_state.clone();
                     ByteStream::from_iter(
                         stream.into_inner().map(move |val| {
-                            let mut str = local_into_string(val, LINE_ENDING, &config);
+                            let mut str = local_into_string(
+                                &engine_state_clone,
+                                val,
+                                LINE_ENDING,
+                                serialize_types,
+                            );
                             str.push_str(LINE_ENDING);
                             str
                         }),
@@ -137,13 +153,18 @@ impl Command for ToText {
     }
 }
 
-fn local_into_string(value: Value, separator: &str, config: &Config) -> String {
+fn local_into_string(
+    engine_state: &EngineState,
+    value: Value,
+    separator: &str,
+    serialize_types: bool,
+) -> String {
     let span = value.span();
     match value {
         Value::Bool { val, .. } => val.to_string(),
         Value::Int { val, .. } => val.to_string(),
         Value::Float { val, .. } => val.to_string(),
-        Value::Filesize { val, .. } => format_filesize_from_conf(val, config),
+        Value::Filesize { val, .. } => val.to_string(),
         Value::Duration { val, .. } => format_duration(val),
         Value::Date { val, .. } => {
             format!("{} ({})", val.to_rfc2822(), HumanTime::from(val))
@@ -153,16 +174,38 @@ fn local_into_string(value: Value, separator: &str, config: &Config) -> String {
         Value::Glob { val, .. } => val,
         Value::List { vals: val, .. } => val
             .into_iter()
-            .map(|x| local_into_string(x, ", ", config))
+            .map(|x| local_into_string(engine_state, x, ", ", serialize_types))
             .collect::<Vec<_>>()
             .join(separator),
         Value::Record { val, .. } => val
             .into_owned()
             .into_iter()
-            .map(|(x, y)| format!("{}: {}", x, local_into_string(y, ", ", config)))
+            .map(|(x, y)| {
+                format!(
+                    "{}: {}",
+                    x,
+                    local_into_string(engine_state, y, ", ", serialize_types)
+                )
+            })
             .collect::<Vec<_>>()
             .join(separator),
-        Value::Closure { val, .. } => format!("<Closure {}>", val.block_id.get()),
+        Value::Closure { val, .. } => {
+            if serialize_types {
+                let block = engine_state.get_block(val.block_id);
+                if let Some(span) = block.span {
+                    let contents_bytes = engine_state.get_span_contents(span);
+                    let contents_string = String::from_utf8_lossy(contents_bytes);
+                    contents_string.to_string()
+                } else {
+                    format!(
+                        "unable to retrieve block contents for text block_id {}",
+                        val.block_id.get()
+                    )
+                }
+            } else {
+                format!("closure_{}", val.block_id.get())
+            }
+        }
         Value::Nothing { .. } => String::new(),
         Value::Error { error, .. } => format!("{error:?}"),
         Value::Binary { val, .. } => format!("{val:?}"),
@@ -171,7 +214,7 @@ fn local_into_string(value: Value, separator: &str, config: &Config) -> String {
         // that critical here
         Value::Custom { val, .. } => val
             .to_base_value(span)
-            .map(|val| local_into_string(val, separator, config))
+            .map(|val| local_into_string(engine_state, val, separator, serialize_types))
             .unwrap_or_else(|_| format!("<{}>", val.type_name())),
     }
 }

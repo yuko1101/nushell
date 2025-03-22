@@ -1,7 +1,11 @@
 #[allow(deprecated)]
 use nu_engine::{command_prelude::*, current_dir, get_eval_block};
-use nu_protocol::{ast, DataSource, NuGlob, PipelineMetadata};
-use std::path::Path;
+use nu_protocol::{
+    ast,
+    shell_error::{self, io::IoError},
+    DataSource, NuGlob, PipelineMetadata,
+};
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "sqlite")]
 use crate::database::SQLiteDatabase;
@@ -31,7 +35,13 @@ impl Command for Open {
 
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build("open")
-            .input_output_types(vec![(Type::Nothing, Type::Any), (Type::String, Type::Any)])
+            .input_output_types(vec![
+                (Type::Nothing, Type::Any),
+                (Type::String, Type::Any),
+                // FIXME Type::Any input added to disable pipeline input type checking, as run-time checks can raise undesirable type errors
+                // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
+                (Type::Any, Type::Any),
+            ])
             .rest(
                 "files",
                 SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
@@ -85,38 +95,45 @@ impl Command for Open {
             let arg_span = path.span;
             // let path_no_whitespace = &path.item.trim_end_matches(|x| matches!(x, '\x09'..='\x0d'));
 
-            for path in nu_engine::glob_from(&path, &cwd, call_span, None)
-                .map_err(|err| match err {
-                    ShellError::DirectoryNotFound { span, .. } => ShellError::FileNotFound {
-                        file: path.item.to_string(),
-                        span,
-                    },
-                    _ => err,
-                })?
-                .1
+            for path in
+                nu_engine::glob_from(&path, &cwd, call_span, None, engine_state.signals().clone())
+                    .map_err(|err| match err {
+                        ShellError::Io(mut err) => {
+                            err.kind = err.kind.not_found_as(NotFound::File);
+                            err.span = arg_span;
+                            err.into()
+                        }
+                        _ => err,
+                    })?
+                    .1
             {
                 let path = path?;
                 let path = Path::new(&path);
 
                 if permission_denied(path) {
+                    let err = IoError::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        arg_span,
+                        PathBuf::from(path),
+                    );
+
                     #[cfg(unix)]
-                    let error_msg = match path.metadata() {
-                        Ok(md) => format!(
-                            "The permissions of {:o} does not allow access for this user",
-                            md.permissions().mode() & 0o0777
-                        ),
-                        Err(e) => e.to_string(),
+                    let err = {
+                        let mut err = err;
+                        err.additional_context = Some(
+                            match path.metadata() {
+                                Ok(md) => format!(
+                                    "The permissions of {:o} does not allow access for this user",
+                                    md.permissions().mode() & 0o0777
+                                ),
+                                Err(e) => e.to_string(),
+                            }
+                            .into(),
+                        );
+                        err
                     };
 
-                    #[cfg(not(unix))]
-                    let error_msg = String::from("Permission denied");
-                    return Err(ShellError::GenericError {
-                        error: "Permission denied".into(),
-                        msg: error_msg,
-                        span: Some(arg_span),
-                        help: None,
-                        inner: vec![],
-                    });
+                    return Err(err.into());
                 } else {
                     #[cfg(feature = "sqlite")]
                     if !raw {
@@ -132,35 +149,25 @@ impl Command for Open {
                         }
                     }
 
-                    let file = match std::fs::File::open(path) {
-                        Ok(file) => file,
-                        Err(err) => {
-                            return Err(ShellError::GenericError {
-                                error: "Permission denied".into(),
-                                msg: err.to_string(),
-                                span: Some(arg_span),
-                                help: None,
-                                inner: vec![],
-                            });
-                        }
-                    };
+                    if path.is_dir() {
+                        // At least under windows this check ensures that we don't get a
+                        // permission denied error on directories
+                        return Err(ShellError::Io(IoError::new(
+                            shell_error::io::ErrorKind::Std(std::io::ErrorKind::IsADirectory),
+                            arg_span,
+                            PathBuf::from(path),
+                        )));
+                    }
 
-                    // Assigning content type should only happen in raw mode. Otherwise, the content
-                    // will potentially be in one of the built-in nushell `from xxx` formats and therefore
-                    // cease to be in the original content-type.... or so I'm told. :)
-                    let content_type = if raw {
-                        path.extension()
-                            .map(|ext| ext.to_string_lossy().to_string())
-                            .and_then(|ref s| detect_content_type(s))
-                    } else {
-                        None
-                    };
+                    let file = std::fs::File::open(path)
+                        .map_err(|err| IoError::new(err.kind(), arg_span, PathBuf::from(path)))?;
 
+                    // No content_type by default - Is added later if no converter is found
                     let stream = PipelineData::ByteStream(
                         ByteStream::file(file, call_span, engine_state.signals().clone()),
                         Some(PipelineMetadata {
                             data_source: DataSource::FilePath(path.to_path_buf()),
-                            content_type,
+                            content_type: None,
                         }),
                     );
 
@@ -203,7 +210,20 @@ impl Command for Open {
                                 }
                                 })?);
                         }
-                        None => output.push(stream),
+                        None => {
+                            // If no converter was found, add content-type metadata
+                            let content_type = path
+                                .extension()
+                                .map(|ext| ext.to_string_lossy().to_string())
+                                .and_then(|ref s| detect_content_type(s));
+
+                            let stream_with_content_type =
+                                stream.set_metadata(Some(PipelineMetadata {
+                                    data_source: DataSource::FilePath(path.to_path_buf()),
+                                    content_type,
+                                }));
+                            output.push(stream_with_content_type);
+                        }
                     }
                 }
             }

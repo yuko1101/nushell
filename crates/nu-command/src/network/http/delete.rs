@@ -6,9 +6,9 @@ use crate::network::http::client::{
 use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct HttpDelete;
 
-impl Command for SubCommand {
+impl Command for HttpDelete {
     fn name(&self) -> &str {
         "http delete"
     }
@@ -214,6 +214,7 @@ fn helper(
     request = request_add_custom_headers(args.headers, request)?;
 
     let response = send_request(
+        engine_state,
         request.clone(),
         args.data,
         args.content_type,
@@ -247,6 +248,6 @@ mod tests {
     fn test_examples() {
         use crate::test_examples;
 
-        test_examples(SubCommand {})
+        test_examples(HttpDelete {})
     }
 }

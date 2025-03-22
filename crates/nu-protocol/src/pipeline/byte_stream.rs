@@ -1,8 +1,15 @@
 //! Module managing the streaming of raw bytes between pipeline elements
+//!
+//! This module also handles conversions the [`ShellError`] <-> [`io::Error`](std::io::Error),
+//! so remember the usage of [`ShellErrorBridge`] where applicable.
 #[cfg(feature = "os")]
 use crate::process::{ChildPipe, ChildProcess};
-use crate::{ErrSpan, IntoSpanned, PipelineData, ShellError, Signals, Span, Type, Value};
+use crate::{
+    shell_error::{bridge::ShellErrorBridge, io::IoError},
+    IntRange, PipelineData, ShellError, Signals, Span, Type, Value,
+};
 use serde::{Deserialize, Serialize};
+use std::ops::Bound;
 #[cfg(unix)]
 use std::os::fd::OwnedFd;
 #[cfg(windows)]
@@ -186,6 +193,7 @@ pub struct ByteStream {
     signals: Signals,
     type_: ByteStreamType,
     known_size: Option<u64>,
+    caller_spans: Vec<Span>,
 }
 
 impl ByteStream {
@@ -202,7 +210,20 @@ impl ByteStream {
             signals,
             type_,
             known_size: None,
+            caller_spans: vec![],
         }
+    }
+
+    /// Push a caller [`Span`] to the bytestream, it's useful to construct a backtrace.
+    pub fn push_caller_span(&mut self, span: Span) {
+        if span != self.span {
+            self.caller_spans.push(span)
+        }
+    }
+
+    /// Get all caller [`Span`], it's useful to construct a backtrace.
+    pub fn get_caller_spans(&self) -> &Vec<Span> {
+        &self.caller_spans
     }
 
     /// Create a [`ByteStream`] from an arbitrary reader. The type must be provided.
@@ -218,6 +239,80 @@ impl ByteStream {
             signals,
             type_,
         )
+    }
+
+    pub fn skip(self, span: Span, n: u64) -> Result<Self, ShellError> {
+        let known_size = self.known_size.map(|len| len.saturating_sub(n));
+        if let Some(mut reader) = self.reader() {
+            // Copy the number of skipped bytes into the sink before proceeding
+            io::copy(&mut (&mut reader).take(n), &mut io::sink())
+                .map_err(|err| IoError::new(err.kind(), span, None))?;
+            Ok(
+                ByteStream::read(reader, span, Signals::empty(), ByteStreamType::Binary)
+                    .with_known_size(known_size),
+            )
+        } else {
+            Err(ShellError::TypeMismatch {
+                err_message: "expected readable stream".into(),
+                span,
+            })
+        }
+    }
+
+    pub fn take(self, span: Span, n: u64) -> Result<Self, ShellError> {
+        let known_size = self.known_size.map(|s| s.min(n));
+        if let Some(reader) = self.reader() {
+            Ok(ByteStream::read(
+                reader.take(n),
+                span,
+                Signals::empty(),
+                ByteStreamType::Binary,
+            )
+            .with_known_size(known_size))
+        } else {
+            Err(ShellError::TypeMismatch {
+                err_message: "expected readable stream".into(),
+                span,
+            })
+        }
+    }
+
+    pub fn slice(
+        self,
+        val_span: Span,
+        call_span: Span,
+        range: IntRange,
+    ) -> Result<Self, ShellError> {
+        if let Some(len) = self.known_size {
+            let start = range.absolute_start(len);
+            let stream = self.skip(val_span, start);
+
+            match range.absolute_end(len) {
+                Bound::Unbounded => stream,
+                Bound::Included(end) | Bound::Excluded(end) if end < start => {
+                    stream.and_then(|s| s.take(val_span, 0))
+                }
+                Bound::Included(end) => {
+                    let distance = end - start + 1;
+                    stream.and_then(|s| s.take(val_span, distance.min(len)))
+                }
+                Bound::Excluded(end) => {
+                    let distance = end - start;
+                    stream.and_then(|s| s.take(val_span, distance.min(len)))
+                }
+            }
+        } else if range.is_relative() {
+            Err(ShellError::RelativeRangeOnInfiniteStream { span: call_span })
+        } else {
+            let start = range.start() as u64;
+            let stream = self.skip(val_span, start);
+
+            match range.distance() {
+                Bound::Unbounded => stream,
+                Bound::Included(distance) => stream.and_then(|s| s.take(val_span, distance + 1)),
+                Bound::Excluded(distance) => stream.and_then(|s| s.take(val_span, distance)),
+            }
+        }
     }
 
     /// Create a [`ByteStream`] from a string. The type of the stream is always `String`.
@@ -272,7 +367,7 @@ impl ByteStream {
     /// binary.
     #[cfg(feature = "os")]
     pub fn stdin(span: Span) -> Result<Self, ShellError> {
-        let stdin = os_pipe::dup_stdin().err_span(span)?;
+        let stdin = os_pipe::dup_stdin().map_err(|err| IoError::new(err.kind(), span, None))?;
         let source = ByteStreamSource::File(convert_file(stdin));
         Ok(Self::new(
             source,
@@ -499,15 +594,16 @@ impl ByteStream {
     /// Any trailing new lines are kept in the returned [`Vec`].
     pub fn into_bytes(self) -> Result<Vec<u8>, ShellError> {
         // todo!() ctrlc
+        let from_io_error = IoError::factory(self.span, None);
         match self.stream {
             ByteStreamSource::Read(mut read) => {
                 let mut buf = Vec::new();
-                read.read_to_end(&mut buf).err_span(self.span)?;
+                read.read_to_end(&mut buf).map_err(&from_io_error)?;
                 Ok(buf)
             }
             ByteStreamSource::File(mut file) => {
                 let mut buf = Vec::new();
-                file.read_to_end(&mut buf).err_span(self.span)?;
+                file.read_to_end(&mut buf).map_err(&from_io_error)?;
                 Ok(buf)
             }
             #[cfg(feature = "os")]
@@ -685,7 +781,12 @@ where
         while let Some(cursor) = self.cursor.as_mut() {
             let read = cursor.read(buf)?;
             if read == 0 {
-                self.cursor = self.iter.next().transpose()?.map(Cursor::new);
+                self.cursor = self
+                    .iter
+                    .next()
+                    .transpose()
+                    .map_err(ShellErrorBridge)?
+                    .map(Cursor::new);
             } else {
                 return Ok(read);
             }
@@ -708,7 +809,7 @@ impl Reader {
 
 impl Read for Reader {
     fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.signals.check(self.span)?;
+        self.signals.check(self.span).map_err(ShellErrorBridge)?;
         self.reader.read(buf)
     }
 }
@@ -752,7 +853,7 @@ impl Iterator for Lines {
                     trim_end_newline(&mut string);
                     Some(Ok(string))
                 }
-                Err(e) => Some(Err(e.into_spanned(self.span).into())),
+                Err(e) => Some(Err(IoError::new(e.kind(), self.span, None).into())),
             }
         }
     }
@@ -948,7 +1049,15 @@ impl Iterator for SplitRead {
         if self.signals.interrupted() {
             return None;
         }
-        self.internal.next().map(|r| r.map_err(|e| e.into()))
+        self.internal.next().map(|r| {
+            r.map_err(|err| {
+                ShellError::Io(IoError::new_internal(
+                    err.kind(),
+                    "Could not get next value for SplitRead",
+                    crate::location!(),
+                ))
+            })
+        })
     }
 }
 
@@ -983,12 +1092,17 @@ impl Chunks {
     }
 
     fn next_string(&mut self) -> Result<Option<String>, (Vec<u8>, ShellError)> {
+        let from_io_error = |err: std::io::Error| match ShellErrorBridge::try_from(err) {
+            Ok(err) => err.0,
+            Err(err) => IoError::new(err.kind(), self.span, None).into(),
+        };
+
         // Get some data from the reader
         let buf = self
             .reader
             .fill_buf()
-            .err_span(self.span)
-            .map_err(|err| (vec![], ShellError::from(err)))?;
+            .map_err(from_io_error)
+            .map_err(|err| (vec![], err))?;
 
         // If empty, this is EOF
         if buf.is_empty() {
@@ -1002,9 +1116,9 @@ impl Chunks {
         if buf.len() < 4 {
             consumed += buf.len();
             self.reader.consume(buf.len());
-            match self.reader.fill_buf().err_span(self.span) {
+            match self.reader.fill_buf() {
                 Ok(more_bytes) => buf.extend_from_slice(more_bytes),
-                Err(err) => return Err((buf, err.into())),
+                Err(err) => return Err((buf, from_io_error(err))),
             }
         }
 
@@ -1059,11 +1173,15 @@ impl Iterator for Chunks {
             match self.type_ {
                 // Binary should always be binary
                 ByteStreamType::Binary => {
-                    let buf = match self.reader.fill_buf().err_span(self.span) {
+                    let buf = match self.reader.fill_buf() {
                         Ok(buf) => buf,
                         Err(err) => {
                             self.error = true;
-                            return Some(Err(err.into()));
+                            return Some(Err(ShellError::Io(IoError::new(
+                                err.kind(),
+                                self.span,
+                                None,
+                            ))));
                         }
                     };
                     if !buf.is_empty() {
@@ -1132,15 +1250,19 @@ pub fn copy_with_signals(
     span: Span,
     signals: &Signals,
 ) -> Result<u64, ShellError> {
+    let from_io_error = IoError::factory(span, None);
     if signals.is_empty() {
         match io::copy(&mut reader, &mut writer) {
             Ok(n) => {
-                writer.flush().err_span(span)?;
+                writer.flush().map_err(&from_io_error)?;
                 Ok(n)
             }
             Err(err) => {
                 let _ = writer.flush();
-                Err(err.into_spanned(span).into())
+                match ShellErrorBridge::try_from(err) {
+                    Ok(ShellErrorBridge(shell_error)) => Err(shell_error),
+                    Err(err) => Err(from_io_error(err).into()),
+                }
             }
         }
     } else {
@@ -1150,7 +1272,7 @@ pub fn copy_with_signals(
         // }
         match generic_copy(&mut reader, &mut writer, span, signals) {
             Ok(len) => {
-                writer.flush().err_span(span)?;
+                writer.flush().map_err(&from_io_error)?;
                 Ok(len)
             }
             Err(err) => {
@@ -1168,6 +1290,7 @@ fn generic_copy(
     span: Span,
     signals: &Signals,
 ) -> Result<u64, ShellError> {
+    let from_io_error = IoError::factory(span, None);
     let buf = &mut [0; DEFAULT_BUF_SIZE];
     let mut len = 0;
     loop {
@@ -1176,10 +1299,13 @@ fn generic_copy(
             Ok(0) => break,
             Ok(n) => n,
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
-            Err(e) => return Err(e.into_spanned(span).into()),
+            Err(e) => match ShellErrorBridge::try_from(e) {
+                Ok(ShellErrorBridge(e)) => return Err(e),
+                Err(e) => return Err(from_io_error(e).into()),
+            },
         };
         len += n;
-        writer.write_all(&buf[..n]).err_span(span)?;
+        writer.write_all(&buf[..n]).map_err(&from_io_error)?;
     }
     Ok(len as u64)
 }
@@ -1204,7 +1330,7 @@ where
             self.buffer.set_position(0);
             self.buffer.get_mut().clear();
             // Ask the generator to generate data
-            if !(self.generator)(self.buffer.get_mut())? {
+            if !(self.generator)(self.buffer.get_mut()).map_err(ShellErrorBridge)? {
                 // End of stream
                 break;
             }

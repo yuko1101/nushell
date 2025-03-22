@@ -1,8 +1,14 @@
 use nu_cmd_base::hook::eval_hook;
 use nu_engine::{command_prelude::*, env_to_strings};
-use nu_path::{dots::expand_ndots, expand_tilde, AbsolutePath};
-use nu_protocol::{did_you_mean, process::ChildProcess, ByteStream, NuGlob, OutDest, Signals};
-use nu_system::ForegroundChild;
+use nu_path::{dots::expand_ndots_safe, expand_tilde, AbsolutePath};
+use nu_protocol::{
+    did_you_mean,
+    engine::{FrozenJob, Job},
+    process::{ChildProcess, PostWaitCallback},
+    shell_error::io::IoError,
+    ByteStream, NuGlob, OutDest, Signals, UseAnsiColoring,
+};
+use nu_system::{kill_by_pid, ForegroundChild, ForegroundWaitStatus};
 use nu_utils::IgnoreCaseExt;
 use pathdiff::diff_paths;
 #[cfg(windows)]
@@ -32,15 +38,10 @@ impl Command for External {
     fn signature(&self) -> nu_protocol::Signature {
         Signature::build(self.name())
             .input_output_types(vec![(Type::Any, Type::Any)])
-            .required(
-                "command",
-                SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::String]),
-                "External command to run.",
-            )
             .rest(
-                "args",
+                "command",
                 SyntaxShape::OneOf(vec![SyntaxShape::GlobPattern, SyntaxShape::Any]),
-                "Arguments for external command.",
+                "External command to run, with arguments.",
             )
             .category(Category::System)
     }
@@ -53,7 +54,15 @@ impl Command for External {
         input: PipelineData,
     ) -> Result<PipelineData, ShellError> {
         let cwd = engine_state.cwd(Some(stack))?;
-        let name: Value = call.req(engine_state, stack, 0)?;
+        let rest = call.rest::<Value>(engine_state, stack, 0)?;
+        let name_args = rest.split_first();
+
+        let Some((name, call_args)) = name_args else {
+            return Err(ShellError::MissingParameter {
+                param_name: "no command given".into(),
+                span: call.head,
+            });
+        };
 
         let name_str: Cow<str> = match &name {
             Value::Glob { val, .. } => Cow::Borrowed(val),
@@ -149,7 +158,7 @@ impl Command for External {
         command.envs(envs);
 
         // Configure args.
-        let args = eval_arguments_from_call(engine_state, stack, call)?;
+        let args = eval_external_arguments(engine_state, stack, call_args.to_vec())?;
         #[cfg(windows)]
         if is_cmd_internal_command(&name_str) || potential_nuscript_in_windows {
             // The /D flag disables execution of AutoRun commands from registry.
@@ -164,7 +173,9 @@ impl Command for External {
 
             // canonicalize the path to the script so that tests pass
             let canon_path = if let Ok(cwd) = engine_state.cwd_as_string(None) {
-                canonicalize_with(&expanded_name, cwd)?
+                canonicalize_with(&expanded_name, cwd).map_err(|err| {
+                    IoError::new(err.kind(), call.head, PathBuf::from(&expanded_name))
+                })?
             } else {
                 // If we can't get the current working directory, just provide the expanded name
                 expanded_name
@@ -186,13 +197,38 @@ impl Command for External {
         let stdout = stack.stdout();
         let stderr = stack.stderr();
         let merged_stream = if matches!(stdout, OutDest::Pipe) && matches!(stderr, OutDest::Pipe) {
-            let (reader, writer) = os_pipe::pipe()?;
-            command.stdout(writer.try_clone()?);
+            let (reader, writer) =
+                os_pipe::pipe().map_err(|err| IoError::new(err.kind(), call.head, None))?;
+            command.stdout(
+                writer
+                    .try_clone()
+                    .map_err(|err| IoError::new(err.kind(), call.head, None))?,
+            );
             command.stderr(writer);
             Some(reader)
         } else {
-            command.stdout(Stdio::try_from(stdout)?);
-            command.stderr(Stdio::try_from(stderr)?);
+            if engine_state.is_background_job()
+                && matches!(stdout, OutDest::Inherit | OutDest::Print)
+            {
+                command.stdout(Stdio::null());
+            } else {
+                command.stdout(
+                    Stdio::try_from(stdout)
+                        .map_err(|err| IoError::new(err.kind(), call.head, None))?,
+                );
+            }
+
+            if engine_state.is_background_job()
+                && matches!(stderr, OutDest::Inherit | OutDest::Print)
+            {
+                command.stderr(Stdio::null());
+            } else {
+                command.stderr(
+                    Stdio::try_from(stderr)
+                        .map_err(|err| IoError::new(err.kind(), call.head, None))?,
+                );
+            }
+
             None
         };
 
@@ -226,13 +262,34 @@ impl Command for External {
         // Spawn the child process. On Unix, also put the child process to
         // foreground if we're in an interactive session.
         #[cfg(windows)]
-        let mut child = ForegroundChild::spawn(command)?;
+        let child = ForegroundChild::spawn(command);
         #[cfg(unix)]
-        let mut child = ForegroundChild::spawn(
+        let child = ForegroundChild::spawn(
             command,
             engine_state.is_interactive,
+            engine_state.is_background_job(),
             &engine_state.pipeline_externals_state,
-        )?;
+        );
+
+        let mut child = child.map_err(|err| {
+            IoError::new_internal(
+                err.kind(),
+                "Could not spawn foreground child",
+                nu_protocol::location!(),
+            )
+        })?;
+
+        if let Some(thread_job) = &engine_state.current_thread_job {
+            if !thread_job.try_add_pid(child.pid()) {
+                kill_by_pid(child.pid().into()).map_err(|err| {
+                    ShellError::Io(IoError::new_internal(
+                        err.kind(),
+                        "Could not spawn external stdin worker",
+                        nu_protocol::location!(),
+                    ))
+                })?;
+            }
+        }
 
         // If we need to copy data into the child process, do it now.
         if let Some(data) = data_to_copy_into_stdin {
@@ -244,8 +301,20 @@ impl Command for External {
                 .spawn(move || {
                     let _ = write_pipeline_data(engine_state, stack, data, stdin);
                 })
-                .err_span(call.head)?;
+                .map_err(|err| {
+                    IoError::new_with_additional_context(
+                        err.kind(),
+                        call.head,
+                        None,
+                        "Could not spawn external stdin worker",
+                    )
+                })?;
         }
+
+        let jobs = engine_state.jobs.clone();
+        let this_job = engine_state.current_thread_job.clone();
+        let is_interactive = engine_state.is_interactive;
+        let child_pid = child.pid();
 
         // Wrap the output into a `PipelineData::ByteStream`.
         let mut child = ChildProcess::new(
@@ -253,6 +322,21 @@ impl Command for External {
             merged_stream,
             matches!(stderr, OutDest::Pipe),
             call.head,
+            // handle wait statuses for job control
+            Some(PostWaitCallback(Box::new(move |status| {
+                if let Some(this_job) = this_job {
+                    this_job.remove_pid(child_pid);
+                }
+
+                if let ForegroundWaitStatus::Frozen(unfreeze) = status {
+                    let mut jobs = jobs.lock().expect("jobs lock is poisoned!");
+
+                    let job_id = jobs.add_job(Job::Frozen(FrozenJob { unfreeze }));
+                    if is_interactive {
+                        println!("\nJob {} is frozen", job_id.get());
+                    }
+                }
+            }))),
         )?;
 
         if matches!(stdout, OutDest::Pipe | OutDest::PipeSeparate)
@@ -288,14 +372,13 @@ impl Command for External {
     }
 }
 
-/// Evaluate all arguments from a call, performing expansions when necessary.
-pub fn eval_arguments_from_call(
+/// Evaluate all arguments, performing expansions when necessary.
+pub fn eval_external_arguments(
     engine_state: &EngineState,
     stack: &mut Stack,
-    call: &Call,
+    call_args: Vec<Value>,
 ) -> Result<Vec<Spanned<OsString>>, ShellError> {
     let cwd = engine_state.cwd(Some(stack))?;
-    let call_args = call.rest::<Value>(engine_state, stack, 1)?;
     let mut args: Vec<Spanned<OsString>> = Vec::with_capacity(call_args.len());
 
     for arg in call_args {
@@ -303,9 +386,14 @@ pub fn eval_arguments_from_call(
         match arg {
             // Expand globs passed to run-external
             Value::Glob { val, no_expand, .. } if !no_expand => args.extend(
-                expand_glob(&val, cwd.as_std_path(), span, engine_state.signals())?
-                    .into_iter()
-                    .map(|s| s.into_spanned(span)),
+                expand_glob(
+                    &val,
+                    cwd.as_std_path(),
+                    span,
+                    engine_state.signals().clone(),
+                )?
+                .into_iter()
+                .map(|s| s.into_spanned(span)),
             ),
             other => args
                 .push(OsString::from(coerce_into_string(engine_state, other)?).into_spanned(span)),
@@ -336,13 +424,11 @@ fn expand_glob(
     arg: &str,
     cwd: &Path,
     span: Span,
-    signals: &Signals,
+    signals: Signals,
 ) -> Result<Vec<OsString>, ShellError> {
-    const GLOB_CHARS: &[char] = &['*', '?', '['];
-
-    // For an argument that doesn't include the GLOB_CHARS, just do the `expand_tilde`
+    // For an argument that isn't a glob, just do the `expand_tilde`
     // and `expand_ndots` expansion
-    if !arg.contains(GLOB_CHARS) {
+    if !nu_glob::is_glob(arg) {
         let path = expand_ndots_safe(expand_tilde(arg));
         return Ok(vec![path.into()]);
     }
@@ -350,7 +436,7 @@ fn expand_glob(
     // We must use `nu_engine::glob_from` here, in order to ensure we get paths from the correct
     // dir
     let glob = NuGlob::Expand(arg.to_owned()).into_spanned(span);
-    if let Ok((prefix, matches)) = nu_engine::glob_from(&glob, cwd, span, None) {
+    if let Ok((prefix, matches)) = nu_engine::glob_from(&glob, cwd, span, None, signals.clone()) {
         let mut result: Vec<OsString> = vec![];
 
         for m in matches {
@@ -412,12 +498,18 @@ fn write_pipeline_data(
     if let PipelineData::ByteStream(stream, ..) = data {
         stream.write_to(writer)?;
     } else if let PipelineData::Value(Value::Binary { val, .. }, ..) = data {
-        writer.write_all(&val)?;
+        writer.write_all(&val).map_err(|err| {
+            IoError::new_internal(
+                err.kind(),
+                "Could not write pipeline data",
+                nu_protocol::location!(),
+            )
+        })?;
     } else {
         stack.start_collect_value();
 
         // Turn off color as we pass data through
-        Arc::make_mut(&mut engine_state.config).use_ansi_coloring = false;
+        Arc::make_mut(&mut engine_state.config).use_ansi_coloring = UseAnsiColoring::False;
 
         // Invoke the `table` command.
         let output =
@@ -426,7 +518,13 @@ fn write_pipeline_data(
         // Write the output.
         for value in output {
             let bytes = value.coerce_into_binary()?;
-            writer.write_all(&bytes)?;
+            writer.write_all(&bytes).map_err(|err| {
+                IoError::new_internal(
+                    err.kind(),
+                    "Could not write pipeline data",
+                    nu_protocol::location!(),
+                )
+            })?;
         }
     }
     Ok(())
@@ -639,21 +737,6 @@ fn escape_cmd_argument(arg: &Spanned<OsString>) -> Result<Cow<'_, OsStr>, ShellE
     }
 }
 
-/// Expand ndots, but only if it looks like it probably contains them, because there is some lossy
-/// path normalization that happens.
-fn expand_ndots_safe(path: impl AsRef<Path>) -> PathBuf {
-    let string = path.as_ref().to_string_lossy();
-
-    // Use ndots if it contains at least `...`, since that's the minimum trigger point, and don't
-    // use it if it contains ://, because that looks like a URL scheme and the path normalization
-    // will mess with that.
-    if string.contains("...") && !string.contains("://") {
-        expand_ndots(path)
-    } else {
-        path.as_ref().to_owned()
-    }
-}
-
 #[cfg(test)]
 mod test {
     use super::*;
@@ -666,30 +749,30 @@ mod test {
 
             let cwd = dirs.test().as_std_path();
 
-            let actual = expand_glob("*.txt", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("*.txt", cwd, Span::unknown(), Signals::empty()).unwrap();
             let expected = &["a.txt", "b.txt"];
             assert_eq!(actual, expected);
 
-            let actual = expand_glob("./*.txt", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("./*.txt", cwd, Span::unknown(), Signals::empty()).unwrap();
             assert_eq!(actual, expected);
 
-            let actual = expand_glob("'*.txt'", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("'*.txt'", cwd, Span::unknown(), Signals::empty()).unwrap();
             let expected = &["'*.txt'"];
             assert_eq!(actual, expected);
 
-            let actual = expand_glob(".", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob(".", cwd, Span::unknown(), Signals::empty()).unwrap();
             let expected = &["."];
             assert_eq!(actual, expected);
 
-            let actual = expand_glob("./a.txt", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("./a.txt", cwd, Span::unknown(), Signals::empty()).unwrap();
             let expected = &["./a.txt"];
             assert_eq!(actual, expected);
 
-            let actual = expand_glob("[*.txt", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("[*.txt", cwd, Span::unknown(), Signals::empty()).unwrap();
             let expected = &["[*.txt"];
             assert_eq!(actual, expected);
 
-            let actual = expand_glob("~/foo.txt", cwd, Span::unknown(), &Signals::empty()).unwrap();
+            let actual = expand_glob("~/foo.txt", cwd, Span::unknown(), Signals::empty()).unwrap();
             let home = dirs::home_dir().expect("failed to get home dir");
             let expected: Vec<OsString> = vec![home.join("foo.txt").into()];
             assert_eq!(actual, expected);

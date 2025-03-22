@@ -1,5 +1,5 @@
 use nu_engine::command_prelude::*;
-use nu_protocol::ListStream;
+use nu_protocol::{shell_error::io::IoError, ListStream};
 use std::{
     io::{BufRead, Cursor, ErrorKind},
     num::NonZeroUsize,
@@ -25,7 +25,7 @@ impl Command for Chunks {
     }
 
     fn description(&self) -> &str {
-        "Divide a list or table into chunks of `chunk_size`."
+        "Divide a list, table or binary input into chunks of `chunk_size`."
     }
 
     fn extra_description(&self) -> &str {
@@ -33,7 +33,7 @@ impl Command for Chunks {
     }
 
     fn search_terms(&self) -> Vec<&str> {
-        vec!["batch", "group"]
+        vec!["batch", "group", "split", "bytes"]
     }
 
     fn examples(&self) -> Vec<Example> {
@@ -119,6 +119,7 @@ pub fn chunks(
     chunk_size: NonZeroUsize,
     span: Span,
 ) -> Result<PipelineData, ShellError> {
+    let from_io_error = IoError::factory(span, None);
     match input {
         PipelineData::Value(Value::List { vals, .. }, metadata) => {
             let chunks = ChunksIter::new(vals, chunk_size, span);
@@ -136,7 +137,7 @@ pub fn chunks(
             };
             let value_stream = chunk_read.map(move |chunk| match chunk {
                 Ok(chunk) => Value::binary(chunk, span),
-                Err(e) => Value::error(e.into(), span),
+                Err(e) => Value::error(from_io_error(e).into(), span),
             });
             let pipeline_data_with_metadata = value_stream.into_pipeline_data_with_metadata(
                 span,
@@ -155,7 +156,7 @@ pub fn chunks(
                     };
                     let value_stream = chunk_read.map(move |chunk| match chunk {
                         Ok(chunk) => Value::binary(chunk, span),
-                        Err(e) => Value::error(e.into(), span),
+                        Err(e) => Value::error(from_io_error(e).into(), span),
                     });
                     value_stream.into_pipeline_data_with_metadata(
                         span,

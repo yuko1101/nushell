@@ -15,6 +15,7 @@ impl Command for Reject {
             .input_output_types(vec![
                 (Type::record(), Type::record()),
                 (Type::table(), Type::table()),
+                (Type::list(Type::Any), Type::list(Type::Any)),
             ])
             .switch(
                 "ignore-errors",
@@ -161,6 +162,14 @@ impl Command for Reject {
                     Value::test_record(record! { "name" => Value::test_string("Cargo.lock") }),
                 ])),
             },
+            Example {
+                description: "Reject item in list",
+                example: "[1 2 3] | reject 1",
+                result: Some(Value::test_list(vec![
+                    Value::test_int(1),
+                    Value::test_int(3),
+                ])),
+            },
         ]
     }
 }
@@ -211,8 +220,14 @@ fn reject(
 
     new_columns.append(&mut new_rows);
 
+    let has_integer_path_member = new_columns.iter().any(|path| {
+        path.members
+            .iter()
+            .any(|member| matches!(member, PathMember::Int { .. }))
+    });
+
     match input {
-        PipelineData::ListStream(stream, ..) => {
+        PipelineData::ListStream(stream, ..) if !has_integer_path_member => {
             let result = stream
                 .into_iter()
                 .map(move |mut value| {

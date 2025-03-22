@@ -1,9 +1,9 @@
 use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct StrExpand;
 
-impl Command for SubCommand {
+impl Command for StrExpand {
     fn name(&self) -> &str {
         "str expand"
     }
@@ -172,6 +172,25 @@ impl Command for SubCommand {
                         Value::test_string("AB3D"),
                         Value::test_string("AC2D"),
                         Value::test_string("AC5D"),
+                    ],
+                    Span::test_data()
+                )),
+            },
+
+            Example {
+                description: "Supports zero padding in numeric ranges.",
+                example: "\"A{08..10}B{11..013}C\" | str expand",
+                result: Some(Value::list(
+                    vec![
+                        Value::test_string("A08B011C"),
+                        Value::test_string("A08B012C"),
+                        Value::test_string("A08B013C"),
+                        Value::test_string("A09B011C"),
+                        Value::test_string("A09B012C"),
+                        Value::test_string("A09B013C"),
+                        Value::test_string("A10B011C"),
+                        Value::test_string("A10B012C"),
+                        Value::test_string("A10B013C"),
                     ],
                     Span::test_data()
                 )),
@@ -358,6 +377,6 @@ mod tests {
     #[test]
     fn test_examples() {
         use crate::test_examples;
-        test_examples(SubCommand {})
+        test_examples(StrExpand {})
     }
 }

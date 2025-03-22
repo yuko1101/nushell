@@ -5,7 +5,7 @@ use std::collections::HashMap;
 use std::sync::LazyLock;
 
 #[derive(Clone)]
-pub struct AnsiCommand;
+pub struct Ansi;
 
 struct AnsiCode {
     short_name: Option<&'static str>,
@@ -466,6 +466,14 @@ static CODE_LIST: LazyLock<Vec<AnsiCode>> = LazyLock::new(|| { vec![
 
     // Cursor position in ESC [ <r>;<c>R where r = row and c = column
     AnsiCode{ short_name: None, long_name:"cursor_position", code: "\x1b[6n".to_string()},
+    // Move cursor one character left
+    AnsiCode{ short_name: None, long_name:"cursor_left", code: "\x1b[D".to_string()},
+    // Move cursor one character right
+    AnsiCode{ short_name: None, long_name:"cursor_right", code: "\x1b[C".to_string()},
+    // Move cursor one line up
+    AnsiCode{ short_name: None, long_name:"cursor_up", code: "\x1b[A".to_string()},
+    // Move cursor one line down
+    AnsiCode{ short_name: None, long_name:"cursor_down", code: "\x1b[B".to_string()},
 
     // Report Terminal Identity
     AnsiCode{ short_name: None, long_name:"identity", code: "\x1b[0c".to_string()},
@@ -497,7 +505,7 @@ static CODE_LIST: LazyLock<Vec<AnsiCode>> = LazyLock::new(|| { vec![
 static CODE_MAP: LazyLock<HashMap<&'static str, &'static str>> =
     LazyLock::new(|| build_ansi_hashmap(&CODE_LIST));
 
-impl Command for AnsiCommand {
+impl Command for Ansi {
     fn name(&self) -> &str {
         "ansi"
     }
@@ -654,7 +662,10 @@ Operating system commands:
         let list: bool = call.has_flag(engine_state, stack, "list")?;
         let escape: bool = call.has_flag(engine_state, stack, "escape")?;
         let osc: bool = call.has_flag(engine_state, stack, "osc")?;
-        let use_ansi_coloring = stack.get_config(engine_state).use_ansi_coloring;
+        let use_ansi_coloring = stack
+            .get_config(engine_state)
+            .use_ansi_coloring
+            .get(engine_state);
 
         if list {
             return Ok(generate_ansi_code_list(
@@ -691,7 +702,10 @@ Operating system commands:
         let list: bool = call.has_flag_const(working_set, "list")?;
         let escape: bool = call.has_flag_const(working_set, "escape")?;
         let osc: bool = call.has_flag_const(working_set, "osc")?;
-        let use_ansi_coloring = working_set.get_config().use_ansi_coloring;
+        let use_ansi_coloring = working_set
+            .get_config()
+            .use_ansi_coloring
+            .get(working_set.permanent());
 
         if list {
             return Ok(generate_ansi_code_list(
@@ -888,12 +902,12 @@ fn build_ansi_hashmap(v: &[AnsiCode]) -> HashMap<&str, &str> {
 
 #[cfg(test)]
 mod tests {
-    use crate::platform::ansi::ansi_::AnsiCommand;
+    use crate::platform::ansi::ansi_::Ansi;
 
     #[test]
     fn examples_work_as_expected() {
         use crate::test_examples;
 
-        test_examples(AnsiCommand {})
+        test_examples(Ansi {})
     }
 }

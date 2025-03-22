@@ -1,9 +1,9 @@
 use nu_engine::command_prelude::*;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct CommandlineEdit;
 
-impl Command for SubCommand {
+impl Command for CommandlineEdit {
     fn name(&self) -> &str {
         "commandline edit"
     }
@@ -29,7 +29,7 @@ impl Command for SubCommand {
             .required(
                 "str",
                 SyntaxShape::String,
-                "the string to perform the operation with",
+                "The string to perform the operation with.",
             )
             .category(Category::Core)
     }

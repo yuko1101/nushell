@@ -5,7 +5,8 @@ use crate::{
         StateDelta, Variable, VirtualPath, Visibility,
     },
     BlockId, Category, CompileError, Config, DeclId, FileId, GetSpan, Module, ModuleId, OverlayId,
-    ParseError, ParseWarning, Signature, Span, SpanId, Type, Value, VarId, VirtualPathId,
+    ParseError, ParseWarning, ResolvedImportPattern, Signature, Span, SpanId, Type, Value, VarId,
+    VirtualPathId,
 };
 use core::panic;
 use std::{
@@ -71,6 +72,10 @@ impl<'a> StateWorkingSet<'a> {
 
     pub fn num_virtual_paths(&self) -> usize {
         self.delta.num_virtual_paths() + self.permanent_state.num_virtual_paths()
+    }
+
+    pub fn num_vars(&self) -> usize {
+        self.delta.num_vars() + self.permanent_state.num_vars()
     }
 
     pub fn num_decls(&self) -> usize {
@@ -364,7 +369,15 @@ impl<'a> StateWorkingSet<'a> {
     }
 
     pub fn get_span_for_filename(&self, filename: &str) -> Option<Span> {
-        let file_id = self.files().position(|file| &*file.name == filename)?;
+        let predicate = |file: &CachedFile| &*file.name == filename;
+        // search from end to start, in case there're duplicated files with the same name
+        let file_id = self
+            .delta
+            .files
+            .iter()
+            .rposition(predicate)
+            .map(|idx| idx + self.permanent_state.num_files())
+            .or_else(|| self.permanent_state.files().rposition(predicate))?;
         let file_id = FileId::new(file_id);
 
         Some(self.get_span_for_file(file_id))
@@ -395,7 +408,7 @@ impl<'a> StateWorkingSet<'a> {
         }
 
         // if no files with span were found, fall back on permanent ones
-        return self.permanent_state.get_span_contents(span);
+        self.permanent_state.get_span_contents(span)
     }
 
     pub fn enter_scope(&mut self) {
@@ -406,6 +419,7 @@ impl<'a> StateWorkingSet<'a> {
         self.delta.exit_scope();
     }
 
+    /// Find the [`DeclId`](crate::DeclId) corresponding to a predeclaration with `name`.
     pub fn find_predecl(&self, name: &[u8]) -> Option<DeclId> {
         let mut removed_overlays = vec![];
 
@@ -424,6 +438,11 @@ impl<'a> StateWorkingSet<'a> {
         None
     }
 
+    /// Find the [`DeclId`](crate::DeclId) corresponding to a declaration with `name`.
+    ///
+    /// Extends [`EngineState::find_decl`] to also search for predeclarations
+    /// (if [`StateWorkingSet::search_predecls`] is set), and declarations from scopes existing
+    /// only in [`StateDelta`].
     pub fn find_decl(&self, name: &[u8]) -> Option<DeclId> {
         let mut removed_overlays = vec![];
 
@@ -462,6 +481,10 @@ impl<'a> StateWorkingSet<'a> {
         self.permanent_state.find_decl(name, &removed_overlays)
     }
 
+    /// Find the name of the declaration corresponding to `decl_id`.
+    ///
+    /// Extends [`EngineState::find_decl_name`] to also search for predeclarations (if [`StateWorkingSet::search_predecls`] is set),
+    /// and declarations from scopes existing only in [`StateDelta`].
     pub fn find_decl_name(&self, decl_id: DeclId) -> Option<&[u8]> {
         let mut removed_overlays = vec![];
 
@@ -503,6 +526,10 @@ impl<'a> StateWorkingSet<'a> {
             .find_decl_name(decl_id, &removed_overlays)
     }
 
+    /// Find the [`ModuleId`](crate::ModuleId) corresponding to `name`.
+    ///
+    /// Extends [`EngineState::find_module`] to also search for ,
+    /// and declarations from scopes existing only in [`StateDelta`].
     pub fn find_module(&self, name: &[u8]) -> Option<ModuleId> {
         let mut removed_overlays = vec![];
 
@@ -836,6 +863,7 @@ impl<'a> StateWorkingSet<'a> {
         self.permanent_state.has_overlay(name)
     }
 
+    /// Find the overlay corresponding to `name`.
     pub fn find_overlay(&self, name: &[u8]) -> Option<&OverlayFrame> {
         for scope_frame in self.delta.scope.iter().rev() {
             if let Some(overlay_id) = scope_frame.find_overlay(name) {
@@ -888,7 +916,12 @@ impl<'a> StateWorkingSet<'a> {
             let name = self.last_overlay_name().to_vec();
             let origin = overlay_frame.origin;
             let prefixed = overlay_frame.prefixed;
-            self.add_overlay(name, origin, vec![], vec![], prefixed);
+            self.add_overlay(
+                name,
+                origin,
+                ResolvedImportPattern::new(vec![], vec![], vec![], vec![]),
+                prefixed,
+            );
         }
 
         self.delta
@@ -925,8 +958,7 @@ impl<'a> StateWorkingSet<'a> {
         &mut self,
         name: Vec<u8>,
         origin: ModuleId,
-        decls: Vec<(Vec<u8>, DeclId)>,
-        modules: Vec<(Vec<u8>, ModuleId)>,
+        definitions: ResolvedImportPattern,
         prefixed: bool,
     ) {
         let last_scope_frame = self.delta.last_scope_frame_mut();
@@ -953,8 +985,22 @@ impl<'a> StateWorkingSet<'a> {
 
         self.move_predecls_to_overlay();
 
-        self.use_decls(decls);
-        self.use_modules(modules);
+        self.use_decls(definitions.decls);
+        self.use_modules(definitions.modules);
+
+        let mut constants = vec![];
+
+        for (name, const_vid) in definitions.constants {
+            constants.push((name, const_vid));
+        }
+
+        for (name, const_val) in definitions.constant_values {
+            let const_var_id =
+                self.add_variable(name.clone(), Span::unknown(), const_val.get_type(), false);
+            self.set_variable_const_val(const_var_id, const_val);
+            constants.push((name, const_var_id));
+        }
+        self.use_variables(constants);
     }
 
     pub fn remove_overlay(&mut self, name: &[u8], keep_custom: bool) {
@@ -1086,13 +1132,13 @@ impl<'a> GetSpan for &'a StateWorkingSet<'a> {
     }
 }
 
-impl<'a> miette::SourceCode for &StateWorkingSet<'a> {
+impl miette::SourceCode for &StateWorkingSet<'_> {
     fn read_span<'b>(
         &'b self,
         span: &miette::SourceSpan,
         context_lines_before: usize,
         context_lines_after: usize,
-    ) -> Result<Box<dyn miette::SpanContents + 'b>, miette::MietteError> {
+    ) -> Result<Box<dyn miette::SpanContents<'b> + 'b>, miette::MietteError> {
         let debugging = std::env::var("MIETTE_DEBUG").is_ok();
         if debugging {
             let finding_span = "Finding span in StateWorkingSet";

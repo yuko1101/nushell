@@ -132,7 +132,7 @@ fn gather_env_vars(
                     working_set.error(err);
                 }
 
-                if working_set.parse_errors.first().is_some() {
+                if !working_set.parse_errors.is_empty() {
                     report_capture_error(
                         engine_state,
                         &String::from_utf8_lossy(contents),
@@ -176,7 +176,7 @@ fn gather_env_vars(
                     working_set.error(err);
                 }
 
-                if working_set.parse_errors.first().is_some() {
+                if !working_set.parse_errors.is_empty() {
                     report_capture_error(
                         engine_state,
                         &String::from_utf8_lossy(contents),
@@ -265,7 +265,10 @@ pub fn eval_source(
     perf!(
         &format!("eval_source {}", &fname),
         start_time,
-        engine_state.get_config().use_ansi_coloring
+        engine_state
+            .get_config()
+            .use_ansi_coloring
+            .get(engine_state)
     );
 
     exit_code

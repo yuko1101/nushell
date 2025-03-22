@@ -18,7 +18,7 @@ const OLD_PLUGIN_FILE: &str = "plugin.nu";
 
 #[cfg(feature = "plugin")]
 pub fn read_plugin_file(engine_state: &mut EngineState, plugin_file: Option<Spanned<String>>) {
-    use nu_protocol::ShellError;
+    use nu_protocol::{shell_error::io::IoError, ShellError};
     use std::path::Path;
 
     let span = plugin_file.as_ref().map(|s| s.span);
@@ -49,7 +49,10 @@ pub fn read_plugin_file(engine_state: &mut EngineState, plugin_file: Option<Span
     perf!(
         "add plugin file to engine_state",
         start_time,
-        engine_state.get_config().use_ansi_coloring
+        engine_state
+            .get_config()
+            .use_ansi_coloring
+            .get(engine_state)
     );
 
     start_time = std::time::Instant::now();
@@ -75,16 +78,12 @@ pub fn read_plugin_file(engine_state: &mut EngineState, plugin_file: Option<Span
                 } else {
                     report_shell_error(
                         engine_state,
-                        &ShellError::GenericError {
-                            error: format!(
-                                "Error while opening plugin registry file: {}",
-                                plugin_path.display()
-                            ),
-                            msg: "plugin path defined here".into(),
-                            span,
-                            help: None,
-                            inner: vec![err.into()],
-                        },
+                        &ShellError::Io(IoError::new_internal_with_path(
+                            err.kind(),
+                            "Could not open plugin registry file",
+                            nu_protocol::location!(),
+                            plugin_path,
+                        )),
                     );
                     return;
                 }
@@ -129,7 +128,10 @@ pub fn read_plugin_file(engine_state: &mut EngineState, plugin_file: Option<Span
         perf!(
             &format!("read plugin file {}", plugin_path.display()),
             start_time,
-            engine_state.get_config().use_ansi_coloring
+            engine_state
+                .get_config()
+                .use_ansi_coloring
+                .get(engine_state)
         );
         start_time = std::time::Instant::now();
 
@@ -145,7 +147,10 @@ pub fn read_plugin_file(engine_state: &mut EngineState, plugin_file: Option<Span
         perf!(
             &format!("load plugin file {}", plugin_path.display()),
             start_time,
-            engine_state.get_config().use_ansi_coloring
+            engine_state
+                .get_config()
+                .use_ansi_coloring
+                .get(engine_state)
         );
     }
 }
@@ -225,8 +230,8 @@ pub fn eval_config_contents(
 #[cfg(feature = "plugin")]
 pub fn migrate_old_plugin_file(engine_state: &EngineState) -> bool {
     use nu_protocol::{
-        PluginExample, PluginIdentity, PluginRegistryItem, PluginRegistryItemData, PluginSignature,
-        ShellError,
+        shell_error::io::IoError, PluginExample, PluginIdentity, PluginRegistryItem,
+        PluginRegistryItemData, PluginSignature, ShellError,
     };
     use std::collections::BTreeMap;
 
@@ -315,7 +320,15 @@ pub fn migrate_old_plugin_file(engine_state: &EngineState) -> bool {
     // Write the new file
     let new_plugin_file_path = config_dir.join(PLUGIN_FILE);
     if let Err(err) = std::fs::File::create(&new_plugin_file_path)
-        .map_err(|e| e.into())
+        .map_err(|err| {
+            IoError::new_internal_with_path(
+                err.kind(),
+                "Could not create new plugin file",
+                nu_protocol::location!(),
+                new_plugin_file_path.clone(),
+            )
+        })
+        .map_err(ShellError::from)
         .and_then(|file| contents.write_to(file, None))
     {
         report_shell_error(
@@ -345,7 +358,10 @@ pub fn migrate_old_plugin_file(engine_state: &EngineState) -> bool {
     perf!(
         "migrate old plugin file",
         start_time,
-        engine_state.get_config().use_ansi_coloring
+        engine_state
+            .get_config()
+            .use_ansi_coloring
+            .get(&engine_state)
     );
     true
 }

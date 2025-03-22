@@ -106,12 +106,27 @@ impl<'e, 's> ScopeData<'e, 's> {
                     })
                     .collect();
 
+                let attributes = decl
+                    .attributes()
+                    .into_iter()
+                    .map(|(name, value)| {
+                        Value::record(
+                            record! {
+                                "name" => Value::string(name, span),
+                                "value" => value,
+                            },
+                            span,
+                        )
+                    })
+                    .collect();
+
                 let record = record! {
                     "name" => Value::string(String::from_utf8_lossy(command_name), span),
                     "category" => Value::string(signature.category.to_string(), span),
                     "signatures" => self.collect_signatures(&signature, span),
                     "description" => Value::string(decl.description(), span),
                     "examples" => Value::list(examples, span),
+                    "attributes" => Value::list(attributes, span),
                     "type" => Value::string(decl.command_type().to_string(), span),
                     "is_sub" => Value::bool(decl.is_sub(), span),
                     "is_const" => Value::bool(decl.is_const(), span),
@@ -529,14 +544,14 @@ impl<'e, 's> ScopeData<'e, 's> {
 }
 
 fn extract_custom_completion_from_arg(engine_state: &EngineState, shape: &SyntaxShape) -> String {
-    return match shape {
+    match shape {
         SyntaxShape::CompleterWrapper(_, custom_completion_decl_id) => {
             let custom_completion_command = engine_state.get_decl(*custom_completion_decl_id);
             let custom_completion_command_name: &str = custom_completion_command.name();
             custom_completion_command_name.to_string()
         }
         _ => "".to_string(),
-    };
+    }
 }
 
 fn sort_rows(decls: &mut [Value]) {

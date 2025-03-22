@@ -70,7 +70,7 @@ impl std::fmt::Debug for CliError<'_> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         let config = self.1.get_config();
 
-        let ansi_support = config.use_ansi_coloring;
+        let ansi_support = config.use_ansi_coloring.get(self.1.permanent());
 
         let error_style = &config.error_style;
 
@@ -96,7 +96,7 @@ impl std::fmt::Debug for CliError<'_> {
     }
 }
 
-impl<'src> miette::Diagnostic for CliError<'src> {
+impl miette::Diagnostic for CliError<'_> {
     fn code<'a>(&'a self) -> Option<Box<dyn std::fmt::Display + 'a>> {
         self.0.code()
     }

@@ -1,10 +1,11 @@
 use crate::{
     ast::{Call, PathMember},
     engine::{EngineState, Stack},
+    location,
+    shell_error::{io::IoError, location::Location},
     ByteStream, ByteStreamType, Config, ListStream, OutDest, PipelineMetadata, Range, ShellError,
     Signals, Span, Type, Value,
 };
-use nu_utils::{stderr_write_all_and_flush, stdout_write_all_and_flush};
 use std::io::Write;
 
 const LINE_ENDING_PATTERN: &[char] = &['\r', '\n'];
@@ -122,10 +123,56 @@ impl PipelineData {
         }
     }
 
+    /// Determine if the `PipelineData` is a [subtype](https://en.wikipedia.org/wiki/Subtyping) of `other`.
+    ///
+    /// This check makes no effort to collect a stream, so it may be a different result
+    /// than would be returned by calling [`Value::is_subtype_of()`] on the result of
+    /// [`.into_value()`](Self::into_value).
+    ///
+    /// A `ListStream` acts the same as an empty list type: it is a subtype of any [`list`](Type::List)
+    /// or [`table`](Type::Table) type. After converting to a value, it may become a more specific type.
+    /// For example, a `ListStream` is a subtype of `list<int>` and `list<string>`.
+    /// If calling [`.into_value()`](Self::into_value) results in a `list<int>`,
+    /// then the value would not be a subtype of `list<string>`, in contrast to the original `ListStream`.
+    ///
+    /// A `ByteStream` is a subtype of [`string`](Type::String) if it is coercible into a string.
+    /// Likewise, a `ByteStream` is a subtype of [`binary`](Type::Binary) if it is coercible into a binary value.
+    pub fn is_subtype_of(&self, other: &Type) -> bool {
+        match (self, other) {
+            (_, Type::Any) => true,
+            (PipelineData::Empty, Type::Nothing) => true,
+            (PipelineData::Value(val, ..), ty) => val.is_subtype_of(ty),
+
+            // a list stream could be a list with any type, including a table
+            (PipelineData::ListStream(..), Type::List(..) | Type::Table(..)) => true,
+
+            (PipelineData::ByteStream(stream, ..), Type::String)
+                if stream.type_().is_string_coercible() =>
+            {
+                true
+            }
+            (PipelineData::ByteStream(stream, ..), Type::Binary)
+                if stream.type_().is_binary_coercible() =>
+            {
+                true
+            }
+
+            (PipelineData::Empty, _) => false,
+            (PipelineData::ListStream(..), _) => false,
+            (PipelineData::ByteStream(..), _) => false,
+        }
+    }
+
     pub fn into_value(self, span: Span) -> Result<Value, ShellError> {
         match self {
             PipelineData::Empty => Ok(Value::nothing(span)),
-            PipelineData::Value(value, ..) => Ok(value.with_span(span)),
+            PipelineData::Value(value, ..) => {
+                if value.span() == Span::unknown() {
+                    Ok(value.with_span(span))
+                } else {
+                    Ok(value)
+                }
+            }
             PipelineData::ListStream(stream, ..) => Ok(stream.into_value()),
             PipelineData::ByteStream(stream, ..) => stream.into_value(),
         }
@@ -173,17 +220,47 @@ impl PipelineData {
             PipelineData::Empty => Ok(()),
             PipelineData::Value(value, ..) => {
                 let bytes = value_to_bytes(value)?;
-                dest.write_all(&bytes)?;
-                dest.flush()?;
+                dest.write_all(&bytes).map_err(|err| {
+                    IoError::new_internal(
+                        err.kind(),
+                        "Could not write PipelineData to dest",
+                        crate::location!(),
+                    )
+                })?;
+                dest.flush().map_err(|err| {
+                    IoError::new_internal(
+                        err.kind(),
+                        "Could not flush PipelineData to dest",
+                        crate::location!(),
+                    )
+                })?;
                 Ok(())
             }
             PipelineData::ListStream(stream, ..) => {
                 for value in stream {
                     let bytes = value_to_bytes(value)?;
-                    dest.write_all(&bytes)?;
-                    dest.write_all(b"\n")?;
+                    dest.write_all(&bytes).map_err(|err| {
+                        IoError::new_internal(
+                            err.kind(),
+                            "Could not write PipelineData to dest",
+                            crate::location!(),
+                        )
+                    })?;
+                    dest.write_all(b"\n").map_err(|err| {
+                        IoError::new_internal(
+                            err.kind(),
+                            "Could not write linebreak after PipelineData to dest",
+                            crate::location!(),
+                        )
+                    })?;
                 }
-                dest.flush()?;
+                dest.flush().map_err(|err| {
+                    IoError::new_internal(
+                        err.kind(),
+                        "Could not flush PipelineData to dest",
+                        crate::location!(),
+                    )
+                })?;
                 Ok(())
             }
             PipelineData::ByteStream(stream, ..) => stream.write_to(dest),
@@ -585,11 +662,24 @@ impl PipelineData {
         no_newline: bool,
         to_stderr: bool,
     ) -> Result<(), ShellError> {
+        let span = self.span();
         if let PipelineData::Value(Value::Binary { val: bytes, .. }, _) = self {
             if to_stderr {
-                stderr_write_all_and_flush(bytes)?;
+                write_all_and_flush(
+                    bytes,
+                    &mut std::io::stderr().lock(),
+                    "stderr",
+                    span,
+                    engine_state.signals(),
+                )?;
             } else {
-                stdout_write_all_and_flush(bytes)?;
+                write_all_and_flush(
+                    bytes,
+                    &mut std::io::stdout().lock(),
+                    "stdout",
+                    span,
+                    engine_state.signals(),
+                )?;
             }
             Ok(())
         } else {
@@ -603,6 +693,7 @@ impl PipelineData {
         no_newline: bool,
         to_stderr: bool,
     ) -> Result<(), ShellError> {
+        let span = self.span();
         if let PipelineData::ByteStream(stream, ..) = self {
             // Copy ByteStreams directly
             stream.print(to_stderr)
@@ -620,9 +711,21 @@ impl PipelineData {
                 }
 
                 if to_stderr {
-                    stderr_write_all_and_flush(out)?
+                    write_all_and_flush(
+                        out,
+                        &mut std::io::stderr().lock(),
+                        "stderr",
+                        span,
+                        engine_state.signals(),
+                    )?;
                 } else {
-                    stdout_write_all_and_flush(out)?
+                    write_all_and_flush(
+                        out,
+                        &mut std::io::stdout().lock(),
+                        "stdout",
+                        span,
+                        engine_state.signals(),
+                    )?;
                 }
             }
 
@@ -657,6 +760,41 @@ impl PipelineData {
             },
         }
     }
+}
+
+pub fn write_all_and_flush<T>(
+    data: T,
+    destination: &mut impl Write,
+    destination_name: &str,
+    span: Option<Span>,
+    signals: &Signals,
+) -> Result<(), ShellError>
+where
+    T: AsRef<[u8]>,
+{
+    let io_error_map = |err: std::io::Error, location: Location| {
+        let context = format!("Writing to {} failed", destination_name);
+        match span {
+            None => IoError::new_internal(err.kind(), context, location),
+            Some(span) if span == Span::unknown() => {
+                IoError::new_internal(err.kind(), context, location)
+            }
+            Some(span) => IoError::new_with_additional_context(err.kind(), span, None, context),
+        }
+    };
+
+    let span = span.unwrap_or(Span::unknown());
+    const OUTPUT_CHUNK_SIZE: usize = 8192;
+    for chunk in data.as_ref().chunks(OUTPUT_CHUNK_SIZE) {
+        signals.check(span)?;
+        destination
+            .write_all(chunk)
+            .map_err(|err| io_error_map(err, location!()))?;
+    }
+    destination
+        .flush()
+        .map_err(|err| io_error_map(err, location!()))?;
+    Ok(())
 }
 
 enum PipelineIteratorInner {

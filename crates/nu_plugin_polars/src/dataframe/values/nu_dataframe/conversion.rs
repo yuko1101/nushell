@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::ops::{Deref, DerefMut};
+use std::sync::Arc;
 
 use chrono::{DateTime, Duration, FixedOffset, NaiveTime, TimeZone, Utc};
 use chrono_tz::Tz;
@@ -8,7 +9,6 @@ use polars::chunked_array::builder::AnonymousOwnedListBuilder;
 use polars::chunked_array::object::builder::ObjectChunkedBuilder;
 use polars::chunked_array::ChunkedArray;
 use polars::datatypes::{AnyValue, PlSmallStr};
-use polars::export::arrow::Either;
 use polars::prelude::{
     ChunkAnyValue, Column as PolarsColumn, DataFrame, DataType, DatetimeChunked, Float32Type,
     Float64Type, Int16Type, Int32Type, Int64Type, Int8Type, IntoSeries, ListBooleanChunkedBuilder,
@@ -18,6 +18,8 @@ use polars::prelude::{
 };
 
 use nu_protocol::{Record, ShellError, Span, Value};
+use polars_arrow::array::Utf8ViewArray;
+use polars_arrow::Either;
 
 use crate::dataframe::values::NuSchema;
 
@@ -474,7 +476,7 @@ fn typed_column_to_series(name: PlSmallStr, column: TypedColumn) -> Result<Serie
             Ok(res.into_series())
         }
         DataType::Struct(fields) => {
-            let schema = Some(NuSchema::new(Schema::from_iter(fields.clone())));
+            let schema = Some(NuSchema::new(Arc::new(Schema::from_iter(fields.clone()))));
             // let mut structs: Vec<Series> = Vec::new();
             let mut structs: HashMap<PlSmallStr, Series> = HashMap::new();
 
@@ -599,7 +601,7 @@ fn input_type_list_to_series(
                     .map(|v| value_to_primitive!(v, $vec_type))
                     .collect::<Result<Vec<$vec_type>, _>>()
                     .map_err(inconsistent_error)?;
-                builder.append_iter_values(value_list.iter().copied());
+                builder.append_values_iter(value_list.iter().copied());
             }
             let res = builder.finish();
             Ok(res.into_series())
@@ -1195,6 +1197,14 @@ fn series_to_values(
                 })?;
             series_to_values(&casted, maybe_from_row, maybe_size, span)
         }
+        DataType::Categorical(maybe_rev_mapping, _categorical_ordering)
+        | DataType::Enum(maybe_rev_mapping, _categorical_ordering) => {
+            if let Some(rev_mapping) = maybe_rev_mapping {
+                Ok(utf8_view_array_to_value(rev_mapping.get_categories()))
+            } else {
+                Ok(vec![])
+            }
+        }
         e => Err(ShellError::GenericError {
             error: "Error creating Dataframe".into(),
             msg: "".to_string(),
@@ -1265,10 +1275,44 @@ fn any_value_to_value(any_value: &AnyValue, span: Span) -> Result<Value, ShellEr
         AnyValue::StringOwned(s) => Ok(Value::string(s.to_string(), span)),
         AnyValue::Binary(bytes) => Ok(Value::binary(*bytes, span)),
         AnyValue::BinaryOwned(bytes) => Ok(Value::binary(bytes.to_owned(), span)),
+        AnyValue::Categorical(_, rev_mapping, utf8_array_pointer)
+        | AnyValue::Enum(_, rev_mapping, utf8_array_pointer) => {
+            let value: Vec<Value> = if utf8_array_pointer.is_null() {
+                utf8_view_array_to_value(rev_mapping.get_categories())
+            } else {
+                // This is no good way around having an unsafe block here
+                // as polars is using a raw pointer to the utf8 array
+                unsafe {
+                    utf8_array_pointer
+                        .get()
+                        .as_ref()
+                        .map(utf8_view_array_to_value)
+                        .unwrap_or_else(Vec::new)
+                }
+            };
+            Ok(Value::list(value, span))
+        }
+        AnyValue::CategoricalOwned(_, rev_mapping, utf8_array_pointer)
+        | AnyValue::EnumOwned(_, rev_mapping, utf8_array_pointer) => {
+            let value: Vec<Value> = if utf8_array_pointer.is_null() {
+                utf8_view_array_to_value(rev_mapping.get_categories())
+            } else {
+                // This is no good way around having an unsafe block here
+                // as polars is using a raw pointer to the utf8 array
+                unsafe {
+                    utf8_array_pointer
+                        .get()
+                        .as_ref()
+                        .map(utf8_view_array_to_value)
+                        .unwrap_or_else(Vec::new)
+                }
+            };
+            Ok(Value::list(value, span))
+        }
         e => Err(ShellError::GenericError {
             error: "Error creating Value".into(),
             msg: "".to_string(),
-            span: None,
+            span: Some(span),
             help: Some(format!("Value not supported in nushell: {e}")),
             inner: Vec::new(),
         }),
@@ -1354,13 +1398,23 @@ where
     }
 }
 
+fn utf8_view_array_to_value(array: &Utf8ViewArray) -> Vec<Value> {
+    array
+        .iter()
+        .map(|x| match x {
+            Some(s) => Value::string(s.to_string(), Span::unknown()),
+            None => Value::nothing(Span::unknown()),
+        })
+        .collect::<Vec<Value>>()
+}
+
 #[cfg(test)]
 mod tests {
     use indexmap::indexmap;
     use nu_protocol::record;
     use polars::datatypes::CompatLevel;
-    use polars::export::arrow::array::{BooleanArray, PrimitiveArray};
     use polars::prelude::Field;
+    use polars_arrow::array::{BooleanArray, PrimitiveArray};
     use polars_io::prelude::StructArray;
 
     use super::*;

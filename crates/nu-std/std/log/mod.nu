@@ -77,7 +77,6 @@ def log-types [] {
     )
 }
 
-
 def parse-string-level [
     level: string
 ] {
@@ -95,7 +94,6 @@ def parse-string-level [
         (log-level).INFO
     }
 }
-
 
 def parse-int-level [
     level: int,
@@ -312,4 +310,14 @@ export def custom [
     ] | reduce --fold $format {
         |it, acc| $acc | str replace --all $it.0 $it.1
     })
+}
+
+def "nu-complete log-level" [] {
+    log-level | transpose description value
+}
+
+# Change logging level
+export def --env set-level [level: int@"nu-complete log-level"] {
+    # Keep it as a string so it can be passed to child processes
+    $env.NU_LOG_LEVEL = $level | into string
 }

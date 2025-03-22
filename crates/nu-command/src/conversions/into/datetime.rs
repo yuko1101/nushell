@@ -49,9 +49,9 @@ impl Zone {
 }
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct IntoDatetime;
 
-impl Command for SubCommand {
+impl Command for IntoDatetime {
     fn name(&self) -> &str {
         "into datetime"
     }
@@ -59,11 +59,17 @@ impl Command for SubCommand {
     fn signature(&self) -> Signature {
         Signature::build("into datetime")
         .input_output_types(vec![
+            (Type::Date, Type::Date),
             (Type::Int, Type::Date),
             (Type::String, Type::Date),
             (Type::List(Box::new(Type::String)), Type::List(Box::new(Type::Date))),
             (Type::table(), Type::table()),
             (Type::record(), Type::record()),
+            (Type::Nothing, Type::table()),
+            // FIXME Type::Any input added to disable pipeline input type checking, as run-time checks can raise undesirable type errors
+            // which aren't caught by the parser. see https://github.com/nushell/nushell/pull/14922 for more details
+            // only applicable for --list flag
+            (Type::Any, Type::table()),
         ])
         .allow_variants_without_examples(true)
         .named(
@@ -204,7 +210,13 @@ impl Command for SubCommand {
             },
             Example {
                 description: "Convert standard (seconds) unix timestamp to a UTC datetime",
-                example: "1614434140 * 1_000_000_000 | into datetime",
+                example: "1614434140 | into datetime -f '%s'",
+                #[allow(clippy::inconsistent_digit_grouping)]
+                result: example_result_1(1614434140_000000000),
+            },
+            Example {
+                description: "Using a datetime as input simply returns the value",
+                example: "2021-02-27T13:55:40 | into datetime",
                 #[allow(clippy::inconsistent_digit_grouping)]
                 result: example_result_1(1614434140_000000000),
             },
@@ -266,6 +278,11 @@ struct DatetimeFormat(String);
 fn action(input: &Value, args: &Arguments, head: Span) -> Value {
     let timezone = &args.zone_options;
     let dateformat = &args.format_options;
+
+    // noop if the input is already a datetime
+    if matches!(input, Value::Date { .. }) {
+        return input.clone();
+    }
 
     // Let's try dtparse first
     if matches!(input, Value::String { .. }) && dateformat.is_none() {
@@ -391,13 +408,10 @@ fn action(input: &Value, args: &Arguments, head: Span) -> Value {
                 Err(reason) => {
                     match NaiveDateTime::parse_from_str(val, &dt.0) {
                         Ok(d) => {
-                            let local_offset = *Local::now().offset();
                             let dt_fixed =
-                                TimeZone::from_local_datetime(&local_offset, &d)
-                                    .single()
-                                    .unwrap_or_default();
+                                Local.from_local_datetime(&d).single().unwrap_or_default();
 
-                            Value::date (dt_fixed,head)
+                            Value::date(dt_fixed.into(),head)
                         }
                         Err(_) => {
                             Value::error (
@@ -481,14 +495,14 @@ fn list_human_readable_examples(span: Span) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use super::{action, DatetimeFormat, SubCommand, Zone};
+    use super::{action, DatetimeFormat, IntoDatetime, Zone};
     use nu_protocol::Type::Error;
 
     #[test]
     fn test_examples() {
         use crate::test_examples;
 
-        test_examples(SubCommand {})
+        test_examples(IntoDatetime {})
     }
 
     #[test]
@@ -632,6 +646,26 @@ mod tests {
             Local.timestamp_opt(1614434140, 0).unwrap().into(),
             Span::test_data(),
         );
+
+        assert_eq!(actual, expected)
+    }
+
+    #[test]
+    fn takes_datetime() {
+        let timezone_option = Some(Spanned {
+            item: Zone::Local,
+            span: Span::test_data(),
+        });
+        let args = Arguments {
+            zone_options: timezone_option,
+            format_options: None,
+            cell_paths: None,
+        };
+        let expected = Value::date(
+            Local.timestamp_opt(1614434140, 0).unwrap().into(),
+            Span::test_data(),
+        );
+        let actual = action(&expected, &args, Span::test_data());
 
         assert_eq!(actual, expected)
     }

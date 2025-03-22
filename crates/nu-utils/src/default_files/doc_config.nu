@@ -3,7 +3,7 @@
 # Warning: This file is intended for documentation purposes only and
 # is not intended to be used as an actual configuration file as-is.
 #
-# version = "0.101.1"
+# version = "0.103.1"
 #
 # A `config.nu` file is used to override default Nushell settings,
 # define (or import) custom commands, or run any other startup tasks.
@@ -97,6 +97,8 @@ $env.config.edit_mode = "emacs"
 # Tip: Set to "editor" to use the default editor on Unix platforms using
 #      the Alternatives system or equivalent
 $env.config.buffer_editor = "editor"
+# To set arguments for the editor, a list can be used:
+$env.config.buffer_editor = ["emacsclient", "-s", "light", "-t"]
 
 # cursor_shape_* (string)
 # -----------------------
@@ -244,12 +246,20 @@ $env.config.shell_integration.reset_application_mode = true
 # Nushell.
 $env.config.bracketed_paste = true
 
-# use_ansi_coloring (bool):
-# true/false to enable/disable the use of ANSI colors in Nushell internal commands.
-# When disabled, output from Nushell built-in commands will display only in the default
-# foreground color.
-# Note: Does not apply to the `ansi` command.
-$env.config.use_ansi_coloring = true
+# use_ansi_coloring ("auto" or bool):
+# The default value `"auto"` dynamically determines if ANSI coloring is used.
+# It evaluates the following environment variables in decreasingly priority:
+# `FORCE_COLOR`, `NO_COLOR`, and `CLICOLOR`.
+# - If `FORCE_COLOR` is set, coloring is always enabled.
+# - If `NO_COLOR` is set, coloring is disabled.
+# - If `CLICOLOR` is set, its value (0 or 1) decides whether coloring is used.
+# If none of these are set, it checks whether the standard output is a terminal
+# and enables coloring if it is.
+# A value of `true` or `false` overrides this behavior, explicitly enabling or
+# disabling ANSI coloring in Nushell's internal commands.
+# When disabled, built-in commands will only use the default foreground color.
+# Note: This setting does not affect the `ansi` command.
+$env.config.use_ansi_coloring = "auto"
 
 # ----------------------
 # Error Display Settings
@@ -363,17 +373,23 @@ $env.config.datetime_format.normal = "%m/%d/%y %I:%M:%S%p"
 # ----------------
 # Filesize Display
 # ----------------
-# filesize.metric (bool): When displaying filesize values ...
-# true: Use the ISO-standard KB, MB, GB
-# false: Use the Windows-standard KiB, MiB, GiB
-$env.config.filesize.metric = false
+# filesize.unit (string): One of either:
+# - A filesize unit: "B", "kB", "KiB", "MB", "MiB", "GB", "GiB", "TB", "TiB", "PB", "PiB", "EB", or "EiB".
+# - An automatically scaled unit: "metric" or "binary".
+# "metric" will use units with metric (SI) prefixes like kB, MB, or GB.
+# "binary" will use units with binary prefixes like KiB, MiB, or GiB.
+# Otherwise, setting this to one of the filesize units will use that particular unit when displaying all file sizes.
+$env.config.filesize.unit = 'metric'
 
-# filesize.format (string): One of either:
-# - The filesize units such as "KB", "KiB", etc. In this case, filesize values always display using
-# this unit.
-# - Or "auto": Filesizes are displayed using the closest unit. For example, 1_000_000_000b will display
-#   as 953.7 MiB (when `metric = false`) or 1.0GB (when `metric = true`)
-$env.config.filesize.format = "auto"
+# filesize.show_unit (bool):
+# Whether to show or hide the file size unit. Useful if `$env.config.filesize.unit` is set to a fixed unit,
+# and you don't want that same unit repeated over and over again in which case you can set this to `false`.
+$env.config.filesize.show_unit = true
+
+# filesize.precision (int or nothing):
+# The number of digits to display after the decimal point for file sizes.
+# When set to `null`, all digits after the decimal point, if any, will be displayed.
+$env.config.filesize.precision = 1
 
 # ---------------------
 # Miscellaneous Display
@@ -775,6 +791,13 @@ $env.config.color_config.empty
 # whitespace, that whitespace will be displayed using this style.
 # Use { attr: n } to disable.
 $env.config.color_config.leading_trailing_space_bg = { bg: 'red' }
+
+# banner_foreground: The default text style for the Welcome Banner displayed at startup
+$env.config.color_config.banner_foreground = "attr_normal"
+
+# banner_highlight1 and banner_highlight2: Colors for highlighted text in the Welcome Banner
+$env.config.color_config.banner_highlight1 = "green"
+$env.config.color_config.banner_highlight2 = "purple"
 
 # ------------------------
 # `explore` command colors

@@ -2,9 +2,9 @@ use nu_engine::command_prelude::*;
 use nu_protocol::{ast::PathMember, IntoValue};
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct SplitCellPath;
 
-impl Command for SubCommand {
+impl Command for SplitCellPath {
     fn name(&self) -> &str {
         "split cell-path"
     }
@@ -121,11 +121,8 @@ fn split_cell_path(val: CellPath, span: Span) -> Result<Value, ShellError> {
                 | PathMember::Int { optional, span, .. } => (optional, span),
             };
             let value = match pm {
-                PathMember::String { val, .. } => Value::String { val, internal_span },
-                PathMember::Int { val, .. } => Value::Int {
-                    val: val as i64,
-                    internal_span,
-                },
+                PathMember::String { val, .. } => Value::string(val, internal_span),
+                PathMember::Int { val, .. } => Value::int(val as i64, internal_span),
             };
             Self { value, optional }
         }
@@ -142,10 +139,7 @@ fn split_cell_path(val: CellPath, span: Span) -> Result<Value, ShellError> {
         })
         .collect();
 
-    Ok(Value::List {
-        vals: members,
-        internal_span: span,
-    })
+    Ok(Value::list(members, span))
 }
 
 #[cfg(test)]
@@ -156,6 +150,6 @@ mod test {
     fn test_examples() {
         use crate::test_examples;
 
-        test_examples(SubCommand {})
+        test_examples(SplitCellPath {})
     }
 }

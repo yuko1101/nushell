@@ -8,9 +8,9 @@ use nu_engine::command_prelude::*;
 use super::client::HttpBody;
 
 #[derive(Clone)]
-pub struct SubCommand;
+pub struct HttpGet;
 
-impl Command for SubCommand {
+impl Command for HttpGet {
     fn name(&self) -> &str {
         "http get"
     }
@@ -182,6 +182,7 @@ fn helper(
     request = request_add_custom_headers(args.headers, request)?;
 
     let response = send_request(
+        engine_state,
         request.clone(),
         HttpBody::None,
         None,
@@ -215,6 +216,6 @@ mod tests {
     fn test_examples() {
         use crate::test_examples;
 
-        test_examples(SubCommand {})
+        test_examples(HttpGet {})
     }
 }

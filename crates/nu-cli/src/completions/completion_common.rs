@@ -51,7 +51,7 @@ fn complete_rec(
     }
 
     let prefix = partial.first().unwrap_or(&"");
-    let mut matcher = NuMatcher::new(prefix, options.clone());
+    let mut matcher = NuMatcher::new(prefix, options);
 
     for built in built_paths {
         let mut path = built.cwd.clone();
@@ -68,7 +68,8 @@ fn complete_rec(
             let entry_isdir = entry.path().is_dir();
             let mut built = built.clone();
             built.parts.push(entry_name.clone());
-            built.isdir = entry_isdir;
+            // Symlinks to directories shouldn't have a trailing slash (#13275)
+            built.isdir = entry_isdir && !entry.path().is_symlink();
 
             if !want_directory || entry_isdir {
                 matcher.add(entry_name.clone(), (entry_name, built));
@@ -157,7 +158,7 @@ pub struct FileSuggestion {
     pub span: nu_protocol::Span,
     pub path: String,
     pub style: Option<Style>,
-    pub cwd: PathBuf,
+    pub is_dir: bool,
 }
 
 /// # Parameters
@@ -196,14 +197,14 @@ pub fn complete_item(
         .map(|cwd| Path::new(cwd.as_ref()).to_path_buf())
         .collect();
     let ls_colors = (engine_state.config.completions.use_ls_colors
-        && engine_state.config.use_ansi_coloring)
-        .then(|| {
-            let ls_colors_env_str = match stack.get_env_var(engine_state, "LS_COLORS") {
-                Some(v) => env_to_string("LS_COLORS", v, engine_state, stack).ok(),
-                None => None,
-            };
-            get_ls_colors(ls_colors_env_str)
-        });
+        && engine_state.config.use_ansi_coloring.get(engine_state))
+    .then(|| {
+        let ls_colors_env_str = match stack.get_env_var(engine_state, "LS_COLORS") {
+            Some(v) => env_to_string("LS_COLORS", v, engine_state, stack).ok(),
+            None => None,
+        };
+        get_ls_colors(ls_colors_env_str)
+    });
 
     let mut cwds = cwd_pathbufs.clone();
     let mut prefix_len = 0;
@@ -261,7 +262,7 @@ pub fn complete_item(
         if should_collapse_dots {
             p = collapse_ndots(p);
         }
-        let cwd = p.cwd.clone();
+        let is_dir = p.isdir;
         let path = original_cwd.apply(p, path_separator);
         let style = ls_colors.as_ref().map(|lsc| {
             lsc.style_for_path_with_metadata(
@@ -275,38 +276,39 @@ pub fn complete_item(
         });
         FileSuggestion {
             span,
-            path: escape_path(path, want_directory),
+            path: escape_path(path),
             style,
-            cwd,
+            is_dir,
         }
     })
     .collect()
 }
 
 // Fix files or folders with quotes or hashes
-pub fn escape_path(path: String, dir: bool) -> String {
+pub fn escape_path(path: String) -> String {
     // make glob pattern have the highest priority.
-    let glob_contaminated = path.contains(['[', '*', ']', '?']);
-    if glob_contaminated {
-        return if path.contains('\'') {
-            // decide to use double quote, also need to escape `"` in path
-            // or else users can't do anything with completed path either.
-            format!("\"{}\"", path.replace('"', r#"\""#))
+    if nu_glob::is_glob(path.as_str()) || path.contains('`') {
+        // expand home `~` for https://github.com/nushell/nushell/issues/13905
+        let pathbuf = nu_path::expand_tilde(path);
+        let path = pathbuf.to_string_lossy();
+        if path.contains('\'') {
+            // decide to use double quotes
+            // Path as Debug will do the escaping for `"`, `\`
+            format!("{:?}", path)
         } else {
             format!("'{path}'")
-        };
-    }
-
-    let filename_contaminated = !dir && path.contains(['\'', '"', ' ', '#', '(', ')']);
-    let dirname_contaminated = dir && path.contains(['\'', '"', ' ', '#']);
-    let maybe_flag = path.starts_with('-');
-    let maybe_variable = path.starts_with('$');
-    let maybe_number = path.parse::<f64>().is_ok();
-    if filename_contaminated || dirname_contaminated || maybe_flag || maybe_variable || maybe_number
-    {
-        format!("`{path}`")
+        }
     } else {
-        path
+        let contaminated =
+            path.contains(['\'', '"', ' ', '#', '(', ')', '{', '}', '[', ']', '|', ';']);
+        let maybe_flag = path.starts_with('-');
+        let maybe_variable = path.starts_with('$');
+        let maybe_number = path.parse::<f64>().is_ok();
+        if contaminated || maybe_flag || maybe_variable || maybe_number {
+            format!("`{path}`")
+        } else {
+            path
+        }
     }
 }
 
@@ -317,12 +319,12 @@ pub struct AdjustView {
 }
 
 pub fn adjust_if_intermediate(
-    prefix: &[u8],
+    prefix: &str,
     working_set: &StateWorkingSet,
     mut span: nu_protocol::Span,
 ) -> AdjustView {
     let span_contents = String::from_utf8_lossy(working_set.get_span_contents(span)).to_string();
-    let mut prefix = String::from_utf8_lossy(prefix).to_string();
+    let mut prefix = prefix.to_string();
 
     // A difference of 1 because of the cursor's unicode code point in between.
     // Using .chars().count() because unicode and Windows.

@@ -3,6 +3,7 @@ use nu_path::canonicalize_with;
 use nu_protocol::{
     ast::Expr,
     engine::{Call, EngineState, Stack, StateWorkingSet},
+    shell_error::io::{ErrorKindExt, IoError, NotFound},
     ShellError, Span, Type, Value, VarId,
 };
 use std::{
@@ -32,7 +33,9 @@ pub fn convert_env_vars(
 ) -> Result<(), ShellError> {
     let conversions = conversions.as_record()?;
     for (key, conversion) in conversions.into_iter() {
-        if let Some(val) = stack.get_env_var_insensitive(engine_state, key) {
+        if let Some((case_preserve_env_name, val)) =
+            stack.get_env_var_insensitive(engine_state, key)
+        {
             match val.get_type() {
                 Type::String => {}
                 _ => continue,
@@ -52,7 +55,7 @@ pub fn convert_env_vars(
                 .run_with_value(val.clone())?
                 .into_value(val.span())?;
 
-            stack.add_env_var(key.clone(), new_val);
+            stack.add_env_var(case_preserve_env_name.to_string(), new_val);
         }
     }
     Ok(())
@@ -64,7 +67,10 @@ pub fn convert_env_vars(
 /// It returns Option instead of Result since we do want to translate all the values we can and
 /// skip errors. This function is called in the main() so we want to keep running, we cannot just
 /// exit.
-pub fn convert_env_values(engine_state: &mut EngineState, stack: &Stack) -> Result<(), ShellError> {
+pub fn convert_env_values(
+    engine_state: &mut EngineState,
+    stack: &mut Stack,
+) -> Result<(), ShellError> {
     let mut error = None;
 
     let mut new_scope = HashMap::new();
@@ -89,22 +95,7 @@ pub fn convert_env_values(engine_state: &mut EngineState, stack: &Stack) -> Resu
         }
     }
 
-    #[cfg(not(windows))]
-    {
-        error = error.or_else(|| ensure_path(&mut new_scope, "PATH"));
-    }
-
-    #[cfg(windows)]
-    {
-        let first_result = ensure_path(&mut new_scope, "Path");
-        if first_result.is_some() {
-            let second_result = ensure_path(&mut new_scope, "PATH");
-
-            if second_result.is_some() {
-                error = error.or(first_result);
-            }
-        }
-    }
+    error = error.or_else(|| ensure_path(engine_state, stack));
 
     if let Ok(last_overlay_name) = &stack.last_overlay_name() {
         if let Some(env_vars) = Arc::make_mut(&mut engine_state.env_vars).get_mut(last_overlay_name)
@@ -149,18 +140,18 @@ pub fn env_to_string(
                     // Try to convert PATH/Path list to a string
                     match value {
                         Value::List { vals, .. } => {
-                            let paths = vals
+                            let paths: Vec<String> = vals
                                 .iter()
-                                .map(Value::coerce_str)
-                                .collect::<Result<Vec<_>, _>>()?;
+                                .filter_map(|v| v.coerce_str().ok())
+                                .map(|s| nu_path::expand_tilde(&*s).to_string_lossy().into_owned())
+                                .collect();
 
-                            match std::env::join_paths(paths.iter().map(AsRef::as_ref)) {
-                                Ok(p) => Ok(p.to_string_lossy().to_string()),
-                                Err(_) => Err(ShellError::EnvVarNotAString {
+                            std::env::join_paths(paths.iter().map(AsRef::<str>::as_ref))
+                                .map(|p| p.to_string_lossy().to_string())
+                                .map_err(|_| ShellError::EnvVarNotAString {
                                     envvar_name: env_name.to_string(),
                                     span: value.span(),
-                                }),
-                            }
+                                })
                         }
                         _ => Err(ShellError::EnvVarNotAString {
                             envvar_name: env_name.to_string(),
@@ -228,9 +219,13 @@ pub fn current_dir(engine_state: &EngineState, stack: &Stack) -> Result<PathBuf,
     // We're using `canonicalize_with` instead of `fs::canonicalize()` because
     // we still need to simplify Windows paths. "." is safe because `cwd` should
     // be an absolute path already.
-    canonicalize_with(&cwd, ".").map_err(|_| ShellError::DirectoryNotFound {
-        dir: cwd.to_string_lossy().to_string(),
-        span: Span::unknown(),
+    canonicalize_with(&cwd, ".").map_err(|err| {
+        ShellError::Io(IoError::new_internal_with_path(
+            err.kind().not_found_as(NotFound::Directory),
+            "Could not canonicalize current dir",
+            nu_protocol::location!(),
+            PathBuf::from(cwd),
+        ))
     })
 }
 
@@ -244,9 +239,13 @@ pub fn current_dir_const(working_set: &StateWorkingSet) -> Result<PathBuf, Shell
     // We're using `canonicalize_with` instead of `fs::canonicalize()` because
     // we still need to simplify Windows paths. "." is safe because `cwd` should
     // be an absolute path already.
-    canonicalize_with(&cwd, ".").map_err(|_| ShellError::DirectoryNotFound {
-        dir: cwd.to_string_lossy().to_string(),
-        span: Span::unknown(),
+    canonicalize_with(&cwd, ".").map_err(|err| {
+        ShellError::Io(IoError::new_internal_with_path(
+            err.kind().not_found_as(NotFound::Directory),
+            "Could not canonicalize current dir",
+            nu_protocol::location!(),
+            PathBuf::from(cwd),
+        ))
     })
 }
 
@@ -257,7 +256,7 @@ pub fn path_str(
     span: Span,
 ) -> Result<String, ShellError> {
     let (pathname, pathval) = match stack.get_env_var_insensitive(engine_state, "path") {
-        Some(v) => Ok((if cfg!(windows) { "Path" } else { "PATH" }, v)),
+        Some((_, v)) => Ok((if cfg!(windows) { "Path" } else { "PATH" }, v)),
         None => Err(ShellError::EnvVarNotFoundAtRuntime {
             envvar_name: if cfg!(windows) {
                 "Path".to_string()
@@ -377,11 +376,11 @@ fn get_converted_value(
     )
 }
 
-fn ensure_path(scope: &mut HashMap<String, Value>, env_path_name: &str) -> Option<ShellError> {
+fn ensure_path(engine_state: &EngineState, stack: &mut Stack) -> Option<ShellError> {
     let mut error = None;
 
     // If PATH/Path is still a string, force-convert it to a list
-    if let Some(value) = scope.get(env_path_name) {
+    if let Some((preserve_case_name, value)) = stack.get_env_var_insensitive(engine_state, "Path") {
         let span = value.span();
         match value {
             Value::String { val, .. } => {
@@ -390,15 +389,17 @@ fn ensure_path(scope: &mut HashMap<String, Value>, env_path_name: &str) -> Optio
                     .map(|p| Value::string(p.to_string_lossy().to_string(), span))
                     .collect();
 
-                scope.insert(env_path_name.to_string(), Value::list(paths, span));
+                stack.add_env_var(preserve_case_name.to_string(), Value::list(paths, span));
             }
             Value::List { vals, .. } => {
                 // Must be a list of strings
                 if !vals.iter().all(|v| matches!(v, Value::String { .. })) {
                     error = error.or_else(|| {
                         Some(ShellError::GenericError {
-                            error: format!("Wrong {env_path_name} environment variable value"),
-                            msg: format!("{env_path_name} must be a list of strings"),
+                            error: format!(
+                                "Incorrect {preserve_case_name} environment variable value"
+                            ),
+                            msg: format!("{preserve_case_name} must be a list of strings"),
                             span: Some(span),
                             help: None,
                             inner: vec![],
@@ -413,8 +414,8 @@ fn ensure_path(scope: &mut HashMap<String, Value>, env_path_name: &str) -> Optio
 
                 error = error.or_else(|| {
                     Some(ShellError::GenericError {
-                        error: format!("Wrong {env_path_name} environment variable value"),
-                        msg: format!("{env_path_name} must be a list of strings"),
+                        error: format!("Incorrect {preserve_case_name} environment variable value"),
+                        msg: format!("{preserve_case_name} must be a list of strings"),
                         span: Some(span),
                         help: None,
                         inner: vec![],

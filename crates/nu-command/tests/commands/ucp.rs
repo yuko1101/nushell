@@ -854,7 +854,7 @@ fn test_cp_arg_no_clobber() {
 fn test_cp_arg_no_clobber_twice() {
     Playground::setup("ucp_test_29", |dirs, sandbox| {
         sandbox.with_files(&[
-            EmptyFile("source.txt"),
+            FileWithContent("source.txt", "fake data"),
             FileWithContent("source_with_body.txt", "some-body"),
         ]);
         nu!(
@@ -894,11 +894,17 @@ fn test_cp_debug_default() {
         {
             panic!("{}", format!("Failure: stdout was \n{}", actual.out));
         }
-        #[cfg(any(target_os = "linux", target_os = "freebsd"))]
+        #[cfg(target_os = "linux")]
         if !actual
             .out
             .contains("copy offload: yes, reflink: unsupported, sparse detection: no")
         {
+            panic!("{}", format!("Failure: stdout was \n{}", actual.out));
+        }
+        #[cfg(target_os = "freebsd")]
+        if !actual.out.contains(
+            "copy offload: unsupported, reflink: unsupported, sparse detection: unsupported",
+        ) {
             panic!("{}", format!("Failure: stdout was \n{}", actual.out));
         }
 

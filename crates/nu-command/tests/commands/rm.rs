@@ -419,7 +419,7 @@ fn set_dir_read_only(directory: &AbsolutePath, read_only: bool) {
 }
 
 #[cfg(not(windows))]
-impl<'a> Drop for Cleanup<'a> {
+impl Drop for Cleanup<'_> {
     /// Restores write permissions to the given directory so that the Playground can be successfully
     /// cleaned up.
     fn drop(&mut self) {
@@ -454,14 +454,8 @@ fn rm_prints_filenames_on_error() {
 
         assert!(files_exist_at(&file_names, test_dir));
         for file_name in file_names {
-            let path = test_dir.join(file_name);
-            let substr = format!("Could not delete {}", path.to_string_lossy());
-            assert!(
-                actual.err.contains(&substr),
-                "Matching: {}\n=== Command stderr:\n{}\n=== End stderr",
-                substr,
-                actual.err
-            );
+            assert!(actual.err.contains("nu::shell::io::permission_denied"));
+            assert!(actual.err.contains(file_name));
         }
     });
 }

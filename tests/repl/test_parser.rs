@@ -95,6 +95,16 @@ fn range_iteration2() -> TestResult {
 }
 
 #[test]
+fn range_ends_with_duration_suffix_variable_name() -> TestResult {
+    run_test("let runs = 10; 1..$runs | math sum", "55")
+}
+
+#[test]
+fn range_ends_with_filesize_suffix_variable_name() -> TestResult {
+    run_test("let sizekb = 10; 1..$sizekb | math sum", "55")
+}
+
+#[test]
 fn simple_value_iteration() -> TestResult {
     run_test("4 | each { |it| $it + 10 }", "14")
 }
@@ -663,7 +673,7 @@ fn comment_in_multiple_pipelines() -> TestResult {
 
 #[test]
 fn date_literal() -> TestResult {
-    run_test(r#"2022-09-10 | date to-record | get day"#, "10")
+    run_test(r#"2022-09-10 | into record | get day"#, "10")
 }
 
 #[test]
@@ -781,12 +791,12 @@ fn duration_with_faulty_number() -> TestResult {
 
 #[test]
 fn filesize_with_underscores_1() -> TestResult {
-    run_test("420_mb", "400.5 MiB")
+    run_test("420_MB", "420.0 MB")
 }
 
 #[test]
 fn filesize_with_underscores_2() -> TestResult {
-    run_test("1_000_000B", "976.6 KiB")
+    run_test("1_000_000B", "1.0 MB")
 }
 
 #[test]

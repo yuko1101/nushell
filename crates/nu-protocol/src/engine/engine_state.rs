@@ -7,6 +7,7 @@ use crate::{
         Variable, Visibility, DEFAULT_OVERLAY_NAME,
     },
     eval_const::create_nu_constant,
+    shell_error::io::IoError,
     BlockId, Category, Config, DeclId, FileId, GetSpan, Handlers, HistoryConfig, Module, ModuleId,
     OverlayId, ShellError, SignalAction, Signals, Signature, Span, SpanId, Type, Value, VarId,
     VirtualPathId,
@@ -29,6 +30,8 @@ type PoisonDebuggerError<'a> = PoisonError<MutexGuard<'a, Box<dyn Debugger>>>;
 
 #[cfg(feature = "plugin")]
 use crate::{PluginRegistryFile, PluginRegistryItem, RegisteredPlugin};
+
+use super::{Jobs, ThreadJob};
 
 #[derive(Clone, Debug)]
 pub enum VirtualPath {
@@ -110,6 +113,19 @@ pub struct EngineState {
     startup_time: i64,
     is_debugging: IsDebugging,
     pub debugger: Arc<Mutex<Box<dyn Debugger>>>,
+
+    pub jobs: Arc<Mutex<Jobs>>,
+
+    // The job being executed with this engine state, or None if main thread
+    pub current_thread_job: Option<ThreadJob>,
+
+    // When there are background jobs running, the interactive behavior of `exit` changes depending on
+    // the value of this flag:
+    // - if this is false, then a warning about running jobs is shown and `exit` enables this flag
+    // - if this is true, then `exit` will `std::process::exit`
+    //
+    // This ensures that running exit twice will terminate the program correctly
+    pub exit_warning_given: Arc<AtomicBool>,
 }
 
 // The max number of compiled regexes to keep around in a LRU cache, arbitrarily chosen
@@ -179,6 +195,9 @@ impl EngineState {
             startup_time: -1,
             is_debugging: IsDebugging::new(false),
             debugger: Arc::new(Mutex::new(Box::new(NoopDebugger))),
+            jobs: Arc::new(Mutex::new(Jobs::default())),
+            current_thread_job: None,
+            exit_warning_given: Arc::new(AtomicBool::new(false)),
         }
     }
 
@@ -322,8 +341,9 @@ impl EngineState {
         }
 
         let cwd = self.cwd(Some(stack))?;
-        // TODO: better error
-        std::env::set_current_dir(cwd)?;
+        std::env::set_current_dir(cwd).map_err(|err| {
+            IoError::new_internal(err.kind(), "Could not set current dir", crate::location!())
+        })?;
 
         if let Some(config) = stack.config.take() {
             // If config was updated in the stack, replace it.
@@ -347,7 +367,7 @@ impl EngineState {
     pub fn active_overlay_ids<'a, 'b>(
         &'b self,
         removed_overlays: &'a [Vec<u8>],
-    ) -> impl DoubleEndedIterator<Item = &OverlayId> + 'a
+    ) -> impl DoubleEndedIterator<Item = &'b OverlayId> + 'a
     where
         'b: 'a,
     {
@@ -361,7 +381,7 @@ impl EngineState {
     pub fn active_overlays<'a, 'b>(
         &'b self,
         removed_overlays: &'a [Vec<u8>],
-    ) -> impl DoubleEndedIterator<Item = &OverlayFrame> + 'a
+    ) -> impl DoubleEndedIterator<Item = &'b OverlayFrame> + 'a
     where
         'b: 'a,
     {
@@ -372,7 +392,7 @@ impl EngineState {
     pub fn active_overlay_names<'a, 'b>(
         &'b self,
         removed_overlays: &'a [Vec<u8>],
-    ) -> impl DoubleEndedIterator<Item = &[u8]> + 'a
+    ) -> impl DoubleEndedIterator<Item = &'b [u8]> + 'a
     where
         'b: 'a,
     {
@@ -466,12 +486,16 @@ impl EngineState {
         None
     }
 
-    pub fn get_env_var_insensitive(&self, name: &str) -> Option<&Value> {
+    // Returns Some((name, value)) if found, None otherwise.
+    // When updating environment variables, make sure to use
+    // the same case (the returned "name") as the original
+    // environment variable name.
+    pub fn get_env_var_insensitive(&self, name: &str) -> Option<(&String, &Value)> {
         for overlay_id in self.scope.active_overlays.iter().rev() {
             let overlay_name = String::from_utf8_lossy(self.get_overlay_name(*overlay_id));
             if let Some(env_vars) = self.env_vars.get(overlay_name.as_ref()) {
                 if let Some(v) = env_vars.iter().find(|(k, _)| k.eq_ignore_case(name)) {
-                    return Some(v.1);
+                    return Some((v.0, v.1));
                 }
             }
         }
@@ -510,13 +534,12 @@ impl EngineState {
                 if err.kind() == std::io::ErrorKind::NotFound {
                     Ok(PluginRegistryFile::default())
                 } else {
-                    Err(ShellError::GenericError {
-                        error: "Failed to open plugin file".into(),
-                        msg: "".into(),
-                        span: None,
-                        help: None,
-                        inner: vec![err.into()],
-                    })
+                    Err(ShellError::Io(IoError::new_internal_with_path(
+                        err.kind(),
+                        "Failed to open plugin file",
+                        crate::location!(),
+                        PathBuf::from(plugin_path),
+                    )))
                 }
             }
         }?;
@@ -527,14 +550,14 @@ impl EngineState {
         }
 
         // Write it to the same path
-        let plugin_file =
-            File::create(plugin_path.as_path()).map_err(|err| ShellError::GenericError {
-                error: "Failed to write plugin file".into(),
-                msg: "".into(),
-                span: None,
-                help: None,
-                inner: vec![err.into()],
-            })?;
+        let plugin_file = File::create(plugin_path.as_path()).map_err(|err| {
+            IoError::new_internal_with_path(
+                err.kind(),
+                "Failed to write plugin file",
+                crate::location!(),
+                PathBuf::from(plugin_path),
+            )
+        })?;
 
         contents.write_to(plugin_file, None)
     }
@@ -599,6 +622,9 @@ impl EngineState {
         }
     }
 
+    /// Find the [`DeclId`](crate::DeclId) corresponding to a declaration with `name`.
+    ///
+    /// Searches within active overlays, and filtering out overlays in `removed_overlays`.
     pub fn find_decl(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<DeclId> {
         let mut visibility: Visibility = Visibility::new();
 
@@ -615,6 +641,9 @@ impl EngineState {
         None
     }
 
+    /// Find the name of the declaration corresponding to `decl_id`.
+    ///
+    /// Searches within active overlays, and filtering out overlays in `removed_overlays`.
     pub fn find_decl_name(&self, decl_id: DeclId, removed_overlays: &[Vec<u8>]) -> Option<&[u8]> {
         let mut visibility: Visibility = Visibility::new();
 
@@ -627,6 +656,33 @@ impl EngineState {
                         return Some(name);
                     }
                 }
+            }
+        }
+
+        None
+    }
+
+    /// Find the [`OverlayId`](crate::OverlayId) corresponding to `name`.
+    ///
+    /// Searches all overlays, not just active overlays. To search only in active overlays, use [`find_active_overlay`](EngineState::find_active_overlay)
+    pub fn find_overlay(&self, name: &[u8]) -> Option<OverlayId> {
+        self.scope.find_overlay(name)
+    }
+
+    /// Find the [`OverlayId`](crate::OverlayId) of the active overlay corresponding to `name`.
+    ///
+    /// Searches only active overlays. To search in all overlays, use [`find_overlay`](EngineState::find_active_overlay)
+    pub fn find_active_overlay(&self, name: &[u8]) -> Option<OverlayId> {
+        self.scope.find_active_overlay(name)
+    }
+
+    /// Find the [`ModuleId`](crate::ModuleId) corresponding to `name`.
+    ///
+    /// Searches within active overlays, and filtering out overlays in `removed_overlays`.
+    pub fn find_module(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<ModuleId> {
+        for overlay_frame in self.active_overlays(removed_overlays).rev() {
+            if let Some(module_id) = overlay_frame.modules.get(name) {
+                return Some(*module_id);
             }
         }
 
@@ -654,16 +710,6 @@ impl EngineState {
         plugin_decls.into_iter().map(|(_, decl)| decl)
     }
 
-    pub fn find_module(&self, name: &[u8], removed_overlays: &[Vec<u8>]) -> Option<ModuleId> {
-        for overlay_frame in self.active_overlays(removed_overlays).rev() {
-            if let Some(module_id) = overlay_frame.modules.get(name) {
-                return Some(*module_id);
-            }
-        }
-
-        None
-    }
-
     pub fn which_module_has_decl(
         &self,
         decl_name: &[u8],
@@ -679,14 +725,6 @@ impl EngineState {
         }
 
         None
-    }
-
-    pub fn find_overlay(&self, name: &[u8]) -> Option<OverlayId> {
-        self.scope.find_overlay(name)
-    }
-
-    pub fn find_active_overlay(&self, name: &[u8]) -> Option<OverlayId> {
-        self.scope.find_active_overlay(name)
     }
 
     pub fn find_commands_by_predicate(
@@ -860,7 +898,9 @@ impl EngineState {
         }
     }
 
-    pub fn files(&self) -> impl Iterator<Item = &CachedFile> {
+    pub fn files(
+        &self,
+    ) -> impl DoubleEndedIterator<Item = &CachedFile> + ExactSizeIterator<Item = &CachedFile> {
         self.files.iter()
     }
 
@@ -1014,6 +1054,9 @@ impl EngineState {
                 cursor_pos: 0,
             }));
         }
+        if Mutex::is_poisoned(&self.jobs) {
+            self.jobs = Arc::new(Mutex::new(Jobs::default()));
+        }
         if Mutex::is_poisoned(&self.regex_cache) {
             self.regex_cache = Arc::new(Mutex::new(LruCache::new(
                 NonZeroUsize::new(REGEX_CACHE_SIZE).expect("tried to create cache of size zero"),
@@ -1034,9 +1077,14 @@ impl EngineState {
             .position(|sp| sp == &span)
             .map(SpanId::new)
     }
+
+    // Determines whether the current state is being held by a background job
+    pub fn is_background_job(&self) -> bool {
+        self.current_thread_job.is_some()
+    }
 }
 
-impl<'a> GetSpan for &'a EngineState {
+impl GetSpan for &EngineState {
     /// Get existing span
     fn get_span(&self, span_id: SpanId) -> Span {
         *self
@@ -1163,7 +1211,7 @@ mod test_cwd {
 
     use crate::{
         engine::{EngineState, Stack},
-        Span, Value,
+        Value,
     };
     use nu_path::{assert_path_eq, AbsolutePath, Path};
     use tempfile::{NamedTempFile, TempDir};
@@ -1226,14 +1274,7 @@ mod test_cwd {
     #[test]
     fn pwd_is_non_string_value() {
         let mut engine_state = EngineState::new();
-        engine_state.add_env_var(
-            "PWD".into(),
-            Value::Glob {
-                val: "*".into(),
-                no_expand: false,
-                internal_span: Span::unknown(),
-            },
-        );
+        engine_state.add_env_var("PWD".into(), Value::test_glob("*"));
         engine_state.cwd(None).unwrap_err();
     }
 

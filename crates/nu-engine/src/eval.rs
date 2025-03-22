@@ -8,7 +8,7 @@ use nu_protocol::{
     engine::{Closure, EngineState, Stack},
     eval_base::Eval,
     BlockId, Config, DataSource, IntoPipelineData, PipelineData, PipelineMetadata, ShellError,
-    Span, Type, Value, VarId, ENV_VARIABLE_ID,
+    Span, Value, VarId, ENV_VARIABLE_ID,
 };
 use nu_utils::IgnoreCaseExt;
 use std::sync::Arc;
@@ -65,24 +65,13 @@ pub fn eval_call<D: DebugContext>(
             if let Some(arg) = call.positional_nth(param_idx) {
                 let result = eval_expression::<D>(engine_state, caller_stack, arg)?;
                 let param_type = param.shape.to_type();
-                if required && !result.get_type().is_subtype(&param_type) {
-                    // need to check if result is an empty list, and param_type is table or list
-                    // nushell needs to pass type checking for the case.
-                    let empty_list_matches = result
-                        .as_list()
-                        .map(|l| {
-                            l.is_empty() && matches!(param_type, Type::List(_) | Type::Table(_))
-                        })
-                        .unwrap_or(false);
-
-                    if !empty_list_matches {
-                        return Err(ShellError::CantConvert {
-                            to_type: param.shape.to_type().to_string(),
-                            from_type: result.get_type().to_string(),
-                            span: result.span(),
-                            help: None,
-                        });
-                    }
+                if required && !result.is_subtype_of(&param_type) {
+                    return Err(ShellError::CantConvert {
+                        to_type: param.shape.to_type().to_string(),
+                        from_type: result.get_type().to_string(),
+                        span: result.span(),
+                        help: None,
+                    });
                 }
                 callee_stack.add_var(var_id, result);
             } else if let Some(value) = &param.default_value {
@@ -531,11 +520,11 @@ impl Eval for EvalRuntime {
 
         let rhs = match assignment {
             Assignment::Assign => rhs,
-            Assignment::PlusAssign => {
+            Assignment::AddAssign => {
                 let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.add(op_span, &rhs, op_span)?
             }
-            Assignment::MinusAssign => {
+            Assignment::SubtractAssign => {
                 let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.sub(op_span, &rhs, op_span)?
             }
@@ -547,7 +536,7 @@ impl Eval for EvalRuntime {
                 let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.div(op_span, &rhs, op_span)?
             }
-            Assignment::ConcatAssign => {
+            Assignment::ConcatenateAssign => {
                 let lhs = eval_expression::<D>(engine_state, stack, lhs)?;
                 lhs.concat(op_span, &rhs, op_span)?
             }
@@ -653,17 +642,17 @@ impl Eval for EvalRuntime {
             .get_block(block_id)
             .captures
             .iter()
-            .map(|&id| {
+            .map(|(id, span)| {
                 stack
-                    .get_var(id, span)
+                    .get_var(*id, *span)
                     .or_else(|_| {
                         engine_state
-                            .get_var(id)
+                            .get_var(*id)
                             .const_val
                             .clone()
-                            .ok_or(ShellError::VariableNotFoundAtRuntime { span })
+                            .ok_or(ShellError::VariableNotFoundAtRuntime { span: *span })
                     })
-                    .map(|var| (id, var))
+                    .map(|var| (*id, var))
             })
             .collect::<Result<_, _>>()?;
 

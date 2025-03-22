@@ -19,8 +19,10 @@ use miette::{ErrReport, IntoDiagnostic, Result};
 use nu_cmd_base::util::get_editor;
 use nu_color_config::StyleComputer;
 #[allow(deprecated)]
-use nu_engine::{convert_env_values, current_dir_str, env_to_strings};
+use nu_engine::env_to_strings;
+use nu_engine::exit::cleanup_exit;
 use nu_parser::{lex, parse, trim_quotes_str};
+use nu_protocol::shell_error::io::IoError;
 use nu_protocol::{
     config::NuCursorShape,
     engine::{EngineState, Stack, StateWorkingSet},
@@ -35,6 +37,7 @@ use reedline::{
     CursorConfig, CwdAwareHinter, DefaultCompleter, EditCommand, Emacs, FileBackedHistory,
     HistorySessionId, Reedline, SqliteBackedHistory, Vi,
 };
+use std::sync::atomic::Ordering;
 use std::{
     collections::HashMap,
     env::temp_dir,
@@ -61,9 +64,7 @@ pub fn evaluate_repl(
     // from the Arc. This lets us avoid copying stack variables needlessly
     let mut unique_stack = stack.clone();
     let config = engine_state.get_config();
-    let use_color = config.use_ansi_coloring;
-
-    confirm_stdin_is_terminal()?;
+    let use_color = config.use_ansi_coloring.get(engine_state);
 
     let mut entry_num = 0;
 
@@ -80,13 +81,6 @@ pub fn evaluate_repl(
         engine_state.clone(),
         stack.clone(),
     );
-
-    let start_time = std::time::Instant::now();
-    // Translate environment variables from Strings to Values
-    if let Err(e) = convert_env_values(engine_state, &unique_stack) {
-        report_shell_error(engine_state, &e);
-    }
-    perf!("translate env vars", start_time, use_color);
 
     // seed env vars
     unique_stack.add_env_var(
@@ -110,6 +104,8 @@ pub fn evaluate_repl(
         );
         engine_state.merge_env(&mut unique_stack)?;
     }
+
+    confirm_stdin_is_terminal()?;
 
     let hostname = System::host_name();
     if shell_integration_osc2 {
@@ -390,7 +386,7 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
         )))
         .with_quick_completions(config.completions.quick)
         .with_partial_completions(config.completions.partial)
-        .with_ansi_colors(config.use_ansi_coloring)
+        .with_ansi_colors(config.use_ansi_coloring.get(engine_state))
         .with_cwd(Some(
             engine_state
                 .cwd(None)
@@ -410,7 +406,7 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
     let style_computer = StyleComputer::from_config(engine_state, &stack_arc);
 
     start_time = std::time::Instant::now();
-    line_editor = if config.use_ansi_coloring {
+    line_editor = if config.use_ansi_coloring.get(engine_state) {
         line_editor.with_hinter(Box::new({
             // As of Nov 2022, "hints" color_config closures only get `null` passed in.
             let style = style_computer.compute("hints", &Value::nothing(Span::unknown()));
@@ -698,7 +694,11 @@ fn loop_iteration(ctx: LoopContext) -> (bool, Stack, Reedline) {
             );
 
             println!();
-            return (false, stack, line_editor);
+
+            cleanup_exit((), engine_state, 0);
+
+            // if cleanup_exit didn't exit, we should keep running
+            return (true, stack, line_editor);
         }
         Err(err) => {
             let message = err.to_string();
@@ -816,8 +816,10 @@ fn parse_operation(
 ) -> Result<ReplOperation, ErrReport> {
     let tokens = lex(s.as_bytes(), 0, &[], &[], false);
     // Check if this is a single call to a directory, if so auto-cd
-    #[allow(deprecated)]
-    let cwd = nu_engine::env::current_dir_str(engine_state, stack).unwrap_or_default();
+    let cwd = engine_state
+        .cwd(Some(stack))
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
     let mut orig = s.clone();
     if orig.starts_with('`') {
         orig = trim_quotes_str(&orig).to_string()
@@ -851,21 +853,26 @@ fn do_auto_cd(
         if !path.exists() {
             report_shell_error(
                 engine_state,
-                &ShellError::DirectoryNotFound {
-                    dir: path.to_string_lossy().to_string(),
+                &ShellError::Io(IoError::new_with_additional_context(
+                    std::io::ErrorKind::NotFound,
                     span,
-                },
+                    PathBuf::from(&path),
+                    "Cannot change directory",
+                )),
             );
         }
         path.to_string_lossy().to_string()
     };
 
-    if let PermissionResult::PermissionDenied(reason) = have_permission(path.clone()) {
+    if let PermissionResult::PermissionDenied(_) = have_permission(path.clone()) {
         report_shell_error(
             engine_state,
-            &ShellError::IOError {
-                msg: format!("Cannot change directory to {path}: {reason}"),
-            },
+            &ShellError::Io(IoError::new_with_additional_context(
+                std::io::ErrorKind::PermissionDenied,
+                span,
+                PathBuf::from(path),
+                "Cannot change directory",
+            )),
         );
         return;
     }
@@ -929,6 +936,9 @@ fn do_run_cmd(
     trace!("eval source: {}", s);
 
     let mut cmds = s.split_whitespace();
+
+    let had_warning_before = engine_state.exit_warning_given.load(Ordering::SeqCst);
+
     if let Some("exit") = cmds.next() {
         let mut working_set = StateWorkingSet::new(engine_state);
         let _ = parse(&mut working_set, None, s.as_bytes(), false);
@@ -937,13 +947,11 @@ fn do_run_cmd(
             match cmds.next() {
                 Some(s) => {
                     if let Ok(n) = s.parse::<i32>() {
-                        drop(line_editor);
-                        std::process::exit(n);
+                        return cleanup_exit(line_editor, engine_state, n);
                     }
                 }
                 None => {
-                    drop(line_editor);
-                    std::process::exit(0);
+                    return cleanup_exit(line_editor, engine_state, 0);
                 }
             }
         }
@@ -962,6 +970,14 @@ fn do_run_cmd(
         false,
     );
 
+    // if there was a warning before, and we got to this point, it means
+    // the possible call to cleanup_exit did not occur.
+    if had_warning_before && engine_state.is_interactive {
+        engine_state
+            .exit_warning_given
+            .store(false, Ordering::SeqCst);
+    }
+
     line_editor
 }
 
@@ -976,8 +992,7 @@ fn run_shell_integration_osc2(
     stack: &mut Stack,
     use_color: bool,
 ) {
-    #[allow(deprecated)]
-    if let Ok(path) = current_dir_str(engine_state, stack) {
+    if let Ok(path) = engine_state.cwd_as_string(Some(stack)) {
         let start_time = Instant::now();
 
         // Try to abbreviate string for windows title
@@ -1021,8 +1036,7 @@ fn run_shell_integration_osc7(
     stack: &mut Stack,
     use_color: bool,
 ) {
-    #[allow(deprecated)]
-    if let Ok(path) = current_dir_str(engine_state, stack) {
+    if let Ok(path) = engine_state.cwd_as_string(Some(stack)) {
         let start_time = Instant::now();
 
         // Otherwise, communicate the path as OSC 7 (often used for spawning new tabs in the same dir)
@@ -1045,8 +1059,7 @@ fn run_shell_integration_osc7(
 }
 
 fn run_shell_integration_osc9_9(engine_state: &EngineState, stack: &mut Stack, use_color: bool) {
-    #[allow(deprecated)]
-    if let Ok(path) = current_dir_str(engine_state, stack) {
+    if let Ok(path) = engine_state.cwd_as_string(Some(stack)) {
         let start_time = Instant::now();
 
         // Otherwise, communicate the path as OSC 9;9 from ConEmu (often used for spawning new tabs in the same dir)
@@ -1070,8 +1083,7 @@ fn run_shell_integration_osc633(
     use_color: bool,
     repl_cmd_line_text: String,
 ) {
-    #[allow(deprecated)]
-    if let Ok(path) = current_dir_str(engine_state, stack) {
+    if let Ok(path) = engine_state.cwd_as_string(Some(stack)) {
         // Supported escape sequences of Microsoft's Visual Studio Code (vscode)
         // https://code.visualstudio.com/docs/terminal/shell-integration#_supported-escape-sequences
         if stack
@@ -1162,7 +1174,7 @@ fn setup_history(
 /// Setup Reedline keybindingds based on the provided config
 ///
 fn setup_keybindings(engine_state: &EngineState, line_editor: Reedline) -> Reedline {
-    return match create_keybindings(engine_state.get_config()) {
+    match create_keybindings(engine_state.get_config()) {
         Ok(keybindings) => match keybindings {
             KeybindingsMode::Emacs(keybindings) => {
                 let edit_mode = Box::new(Emacs::new(keybindings));
@@ -1180,7 +1192,7 @@ fn setup_keybindings(engine_state: &EngineState, line_editor: Reedline) -> Reedl
             report_shell_error(engine_state, &e);
             line_editor
         }
-    };
+    }
 }
 
 ///
@@ -1577,6 +1589,13 @@ mod test_auto_cd {
         symlink(&dir, &link).unwrap();
         let input = if cfg!(windows) { r".\link" } else { "./link" };
         check(tempdir, input, link);
+
+        let dir = tempdir.join("foo").join("bar");
+        std::fs::create_dir_all(&dir).unwrap();
+        let link = tempdir.join("link2");
+        symlink(&dir, &link).unwrap();
+        let input = "..";
+        check(link, input, tempdir);
     }
 
     #[test]

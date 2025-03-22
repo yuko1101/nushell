@@ -1,7 +1,10 @@
-use fuzzy_matcher::{skim::SkimMatcherV2, FuzzyMatcher};
 use nu_parser::trim_quotes_str;
 use nu_protocol::{CompletionAlgorithm, CompletionSort};
 use nu_utils::IgnoreCaseExt;
+use nucleo_matcher::{
+    pattern::{Atom, AtomKind, CaseMatching, Normalization},
+    Config, Matcher, Utf32Str,
+};
 use std::{borrow::Cow, fmt::Display};
 
 use super::SemanticSuggestion;
@@ -22,8 +25,8 @@ pub enum MatchAlgorithm {
     Fuzzy,
 }
 
-pub struct NuMatcher<T> {
-    options: CompletionOptions,
+pub struct NuMatcher<'a, T> {
+    options: &'a CompletionOptions,
     needle: String,
     state: State<T>,
 }
@@ -34,42 +37,51 @@ enum State<T> {
         items: Vec<(String, T)>,
     },
     Fuzzy {
-        matcher: Box<SkimMatcherV2>,
+        matcher: Matcher,
+        atom: Atom,
         /// Holds (haystack, item, score)
-        items: Vec<(String, T, i64)>,
+        items: Vec<(String, T, u16)>,
     },
 }
 
 /// Filters and sorts suggestions
-impl<T> NuMatcher<T> {
+impl<T> NuMatcher<'_, T> {
     /// # Arguments
     ///
     /// * `needle` - The text to search for
-    pub fn new(needle: impl AsRef<str>, options: CompletionOptions) -> NuMatcher<T> {
-        let orig_needle = trim_quotes_str(needle.as_ref());
-        let lowercase_needle = if options.case_sensitive {
-            orig_needle.to_owned()
-        } else {
-            orig_needle.to_folded_case()
-        };
+    pub fn new(needle: impl AsRef<str>, options: &CompletionOptions) -> NuMatcher<T> {
+        let needle = trim_quotes_str(needle.as_ref());
         match options.match_algorithm {
-            MatchAlgorithm::Prefix => NuMatcher {
-                options,
-                needle: lowercase_needle,
-                state: State::Prefix { items: Vec::new() },
-            },
-            MatchAlgorithm::Fuzzy => {
-                let mut matcher = SkimMatcherV2::default();
-                if options.case_sensitive {
-                    matcher = matcher.respect_case();
+            MatchAlgorithm::Prefix => {
+                let lowercase_needle = if options.case_sensitive {
+                    needle.to_owned()
                 } else {
-                    matcher = matcher.ignore_case();
+                    needle.to_folded_case()
                 };
                 NuMatcher {
                     options,
-                    needle: orig_needle.to_owned(),
+                    needle: lowercase_needle,
+                    state: State::Prefix { items: Vec::new() },
+                }
+            }
+            MatchAlgorithm::Fuzzy => {
+                let atom = Atom::new(
+                    needle,
+                    if options.case_sensitive {
+                        CaseMatching::Respect
+                    } else {
+                        CaseMatching::Ignore
+                    },
+                    Normalization::Smart,
+                    AtomKind::Fuzzy,
+                    false,
+                );
+                NuMatcher {
+                    options,
+                    needle: needle.to_owned(),
                     state: State::Fuzzy {
-                        matcher: Box::new(matcher),
+                        matcher: Matcher::new(Config::DEFAULT),
+                        atom,
                         items: Vec::new(),
                     },
                 }
@@ -102,8 +114,15 @@ impl<T> NuMatcher<T> {
                 }
                 matches
             }
-            State::Fuzzy { items, matcher } => {
-                let Some(score) = matcher.fuzzy_match(haystack, &self.needle) else {
+            State::Fuzzy {
+                matcher,
+                atom,
+                items,
+            } => {
+                let mut haystack_buf = Vec::new();
+                let haystack_utf32 = Utf32Str::new(trim_quotes_str(haystack), &mut haystack_buf);
+                let mut indices = Vec::new();
+                let Some(score) = atom.indices(haystack_utf32, matcher, &mut indices) else {
                     return false;
                 };
                 if let Some(item) = item {
@@ -165,7 +184,7 @@ impl<T> NuMatcher<T> {
     }
 }
 
-impl NuMatcher<SemanticSuggestion> {
+impl NuMatcher<'_, SemanticSuggestion> {
     pub fn add_semantic_suggestion(&mut self, sugg: SemanticSuggestion) -> bool {
         let value = sugg.suggestion.value.to_string();
         self.add(value, sugg)
@@ -252,7 +271,7 @@ mod test {
             match_algorithm,
             ..Default::default()
         };
-        let mut matcher = NuMatcher::new(needle, options);
+        let mut matcher = NuMatcher::new(needle, &options);
         matcher.add(haystack, haystack);
         if should_match {
             assert_eq!(vec![haystack], matcher.results());
@@ -267,11 +286,29 @@ mod test {
             match_algorithm: MatchAlgorithm::Fuzzy,
             ..Default::default()
         };
-        let mut matcher = NuMatcher::new("fob", options);
+        let mut matcher = NuMatcher::new("fob", &options);
         for item in ["foo/bar", "fob", "foo bar"] {
             matcher.add(item, item);
         }
         // Sort by score, then in alphabetical order
         assert_eq!(vec!["fob", "foo bar", "foo/bar"], matcher.results());
+    }
+
+    #[test]
+    fn match_algorithm_fuzzy_sort_strip() {
+        let options = CompletionOptions {
+            match_algorithm: MatchAlgorithm::Fuzzy,
+            ..Default::default()
+        };
+        let mut matcher = NuMatcher::new("'love spaces' ", &options);
+        for item in [
+            "'i love spaces'",
+            "'i love spaces' so much",
+            "'lovespaces' ",
+        ] {
+            matcher.add(item, item);
+        }
+        // Make sure the spaces are respected
+        assert_eq!(vec!["'i love spaces' so much"], matcher.results());
     }
 }

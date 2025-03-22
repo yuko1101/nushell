@@ -1,15 +1,17 @@
 use crate::util::{eval_source, print_pipeline};
 use log::{info, trace};
-use nu_engine::{convert_env_values, eval_block};
+use nu_engine::eval_block;
 use nu_parser::parse;
 use nu_path::canonicalize_with;
 use nu_protocol::{
     cli_error::report_compile_error,
     debugger::WithoutDebug,
     engine::{EngineState, Stack, StateWorkingSet},
-    report_parse_error, report_parse_warning, PipelineData, ShellError, Span, Value,
+    report_parse_error, report_parse_warning,
+    shell_error::io::*,
+    PipelineData, ShellError, Span, Value,
 };
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 /// Entry point for evaluating a file.
 ///
@@ -22,16 +24,16 @@ pub fn evaluate_file(
     stack: &mut Stack,
     input: PipelineData,
 ) -> Result<(), ShellError> {
-    // Convert environment variables from Strings to Values and store them in the engine state.
-    convert_env_values(engine_state, stack)?;
-
     let cwd = engine_state.cwd_as_string(Some(stack))?;
 
-    let file_path =
-        canonicalize_with(&path, cwd).map_err(|err| ShellError::FileNotFoundCustom {
-            msg: format!("Could not access file '{path}': {err}"),
-            span: Span::unknown(),
-        })?;
+    let file_path = canonicalize_with(&path, cwd).map_err(|err| {
+        IoError::new_internal_with_path(
+            err.kind().not_found_as(NotFound::File),
+            "Could not access file",
+            nu_protocol::location!(),
+            PathBuf::from(&path),
+        )
+    })?;
 
     let file_path_str = file_path
         .to_str()
@@ -43,18 +45,24 @@ pub fn evaluate_file(
             span: Span::unknown(),
         })?;
 
-    let file = std::fs::read(&file_path).map_err(|err| ShellError::FileNotFoundCustom {
-        msg: format!("Could not read file '{file_path_str}': {err}"),
-        span: Span::unknown(),
+    let file = std::fs::read(&file_path).map_err(|err| {
+        IoError::new_internal_with_path(
+            err.kind().not_found_as(NotFound::File),
+            "Could not read file",
+            nu_protocol::location!(),
+            file_path.clone(),
+        )
     })?;
     engine_state.file = Some(file_path.clone());
 
-    let parent = file_path
-        .parent()
-        .ok_or_else(|| ShellError::FileNotFoundCustom {
-            msg: format!("The file path '{file_path_str}' does not have a parent"),
-            span: Span::unknown(),
-        })?;
+    let parent = file_path.parent().ok_or_else(|| {
+        IoError::new_internal_with_path(
+            ErrorKind::DirectoryNotFound,
+            "The file path does not have a parent",
+            nu_protocol::location!(),
+            file_path.clone(),
+        )
+    })?;
 
     stack.add_env_var(
         "FILE_PWD".to_string(),
